@@ -14,11 +14,11 @@ if (args.Length > 0 && args[0] == "genkeys")
 
 // ─── Конфиг ────────────────────────────────────────────────────────────────
 var config = new VpnConfig(
-    ServerHost:      Environment.GetEnvironmentVariable("VPN_SERVER")      ?? "your-server.com",
-    ServerPort:      int.Parse(Environment.GetEnvironmentVariable("VPN_PORT") ?? "443"),
-    ServerPublicKey: Environment.GetEnvironmentVariable("VPN_SERVER_PUBKEY") ?? "",
-    ClientPrivateKey:Environment.GetEnvironmentVariable("VPN_CLIENT_PRIVKEY") ?? "",
-    SniDomain:       Environment.GetEnvironmentVariable("VPN_SNI")         ?? "www.microsoft.com",
+    ServerHost:      Environment.GetEnvironmentVariable("VPN_SERVER")      ?? "service.cyberius.site",
+    ServerPort:      int.Parse(Environment.GetEnvironmentVariable("VPN_PORT") ?? "3443"),
+    ServerPublicKey: Environment.GetEnvironmentVariable("VPN_SERVER_PUBKEY") ?? "efcCebJhIdy69kdmE6UT70T5+H00tiiO1GcCeLVtKkk=",
+    ClientPrivateKey:Environment.GetEnvironmentVariable("VPN_CLIENT_PRIVKEY") ?? "2PXPwNYrbk6S7bn1XA914W7T10+HZu99lXUrgNwaPG8=",
+    SniDomain:       Environment.GetEnvironmentVariable("VPN_SNI")         ?? "www.google.com",
     TunAddress:      "10.8.0.2",
     TunMask:         "255.255.255.0"
 );

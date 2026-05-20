@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using CyberiusVPN.Core.Crypto;
 using CyberiusVPN.Core.Models;
 using CyberiusVPN.Core.Protocol;
@@ -86,7 +87,7 @@ public sealed class VpnClient
         await tun.OpenAsync("vpn0", _config.TunAddress, _config.TunMask, _config.Mtu);
 
         // 6. Настраиваем маршруты
-        SetupRoutes(_config.TunAddress);
+        SetupRoutes(_config.ServerHost, _config.TunAddress);
 
         // 7. Запускаем туннель
         var sessionId = (uint)Random.Shared.Next();
@@ -219,18 +220,21 @@ public sealed class VpnClient
         return ms.ToArray();
     }
 
-    private static void SetupRoutes(string tunAddress)
+    private static void SetupRoutes(string serverHost, string tunAddress)
     {
-        // На Linux: добавляем маршрут по умолчанию через TUN
-        if (System.Runtime.InteropServices.RuntimeInformation
-            .IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux))
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Run("ip", "route add default dev vpn0");
+            // Сначала удаляем старый маршрут если есть — игнорируем ошибку
+            Run("route", $"delete {serverHost}");
+            Run("route", "delete 0.0.0.0 mask 0.0.0.0");
+
+            // Добавляем заново
+            Run("route", $"add 0.0.0.0 mask 0.0.0.0 {tunAddress} metric 5");
         }
         else
         {
-            // Windows: через route add
-            Run("route", "add 0.0.0.0 mask 0.0.0.0 " + tunAddress);
+            Run("ip", "route del default dev vpn0 2>/dev/null || true");
+            Run("ip", "route add default dev vpn0");
         }
     }
 

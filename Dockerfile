@@ -2,8 +2,8 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
 # Копируем проекты
-COPY CyberiusVPN.Core/Cyberius.Core.csproj       CyberiusVPN.Core/
-COPY Cyberius.Server/Cyberius.Server.csproj   CyberiusVPN.Server/
+COPY CyberiusVPN.Core/CyberiusVPN.Core.csproj       CyberiusVPN.Core/
+COPY CyberiusVPN.Server/CyberiusVPN.Server.csproj   CyberiusVPN.Server/
 
 # Восстанавливаем зависимости
 RUN dotnet restore CyberiusVPN.Server/CyberiusVPN.Server.csproj

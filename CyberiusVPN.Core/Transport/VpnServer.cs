@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using CyberiusVPN.Core.Crypto;
 using CyberiusVPN.Core.Models;
 using CyberiusVPN.Core.Tun;
@@ -27,6 +28,7 @@ public sealed class VpnServer
     // Хранилище активных сессий
     private readonly Dictionary<uint, VpnSession> _sessions = new();
     private readonly SemaphoreSlim                _lock     = new(1, 1);
+    private int _nextClientIp = 2;
 
     // Ключи сервера
     private readonly byte[] _serverPrivateKey;
@@ -172,27 +174,37 @@ public sealed class VpnServer
 
     private async Task HandleVpnClientAsync(NetworkStream stream, byte[] clientPublicKey, CancellationToken ct)
     {
-        // 1. Вычисляем shared secret
-        var sharedSecret = KeyExchange.ComputeSharedSecret(_serverPrivateKey, clientPublicKey);
-        var salt         = RandomNumberGeneratorSalt();
-        var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
-
-        // 2. Отправляем salt клиенту (он нужен для деривации ключей с обеих сторон)
+        var salt = new byte[32];
+        RandomNumberGenerator.Fill(salt);
         await stream.WriteAsync(salt, ct);
 
-        // 3. Создаём сессию
-        var sessionId = (uint)Random.Shared.Next();
-        var framer    = new VpnFramer(keys, sessionId, _logger);
+        var sharedSecret = KeyExchange.ComputeSharedSecret(_serverPrivateKey, clientPublicKey);
+        var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
 
-        // 4. Открываем TUN (серверная сторона туннеля)
-        var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
-        await tun.OpenAsync($"vpns{sessionId:X4}", _config.TunAddress, "255.255.255.0");
+        var clientIpNum = Interlocked.Increment(ref _nextClientIp);
+        var tunName     = $"vpns{clientIpNum}";
 
-        // 5. Запускаем туннель
-        var tunnel = new VpnTunnel(framer, tun, stream, _logger);
-        await tunnel.RunAsync(ct);
+        _logger.LogInformation("Opening TUN {Name}...", tunName); // ← добавь
 
-        await tun.DisposeAsync();
+        try  // ← добавь весь try/catch
+        {
+            var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
+            await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
+
+            var sessionId = (uint)Random.Shared.Next();
+            var framer    = new VpnFramer(keys, sessionId, _logger);
+            var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
+
+            _logger.LogInformation("Tunnel running for {Name}", tunName); // ← добавь
+
+            await tunnel.RunAsync(ct);
+            await tun.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError("TUN/Tunnel error for {Name}: {Msg}", tunName, ex.Message); // ← добавь
+            _logger.LogError("Stack: {Stack}", ex.StackTrace);
+        }
     }
 
     /// <summary>
