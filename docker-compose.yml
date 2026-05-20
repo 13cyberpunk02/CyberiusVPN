@@ -1,0 +1,25 @@
+services:
+  vpn-server:
+    build: .
+    container_name: cyberiusvpn-server
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    ports:
+      - "3443:3443"
+
+    environment:
+      VPN_PORT:           "3443"
+      VPN_SNI:            "www.google.com"      
+      VPN_SERVER_PRIVKEY: "${VPN_SERVER_PRIVKEY}"    
+    sysctls:
+      - net.ipv4.ip_forward=1
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

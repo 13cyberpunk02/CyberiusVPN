@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="CyberiusVPN.Client/CyberiusVPN.Client.csproj" />
+  <Project Path="CyberiusVPN.Core/CyberiusVPN.Core.csproj" />
+  <Project Path="CyberiusVPN.Server/CyberiusVPN.Server.csproj" />
+</Solution>
