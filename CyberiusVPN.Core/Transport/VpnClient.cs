@@ -30,6 +30,8 @@ public sealed class VpnClient
     private readonly ILoggerFactory _loggerFactory;
     private readonly byte[]         _clientPrivateKey;
     private readonly byte[]         _serverPublicKey;
+    private static string _savedGateway = "";
+    private static string _savedIface   = "";
 
     /// <summary>
     /// Создаёт VPN клиент.
@@ -86,7 +88,7 @@ public sealed class VpnClient
             var (ephPrivKey, ephPubKey) = KeyExchange.GenerateKeyPair();
 
             // 2. Auth-токен (будет в session_id ClientHello)
-            var authToken = RealityHandshake.BuildAuthToken(_clientPrivateKey, _serverPublicKey);
+            var authToken = RealityHandshake.BuildAuthToken(ephPrivKey, _serverPublicKey);
 
             // 3. Отправляем ClientHello с Chrome fingerprint
             await SendRealityClientHelloAsync(stream, authToken, ephPubKey, ct);
@@ -263,7 +265,10 @@ public sealed class VpnClient
             var addresses = System.Net.Dns.GetHostAddresses(serverHost);
             if (addresses.Length > 0) serverIp = addresses[0].ToString();
         }
-        catch { }
+        catch
+        {
+            // ignored
+        }
 
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -290,6 +295,9 @@ public sealed class VpnClient
             var gw    = parts.Length > 2 ? parts[2] : "";
             var iface = parts.Length > 4 ? parts[4] : "";
 
+            _savedGateway = gw;
+            _savedIface   = iface;
+            
             Console.WriteLine($"Gateway: {gw} via {iface}, server: {serverIp}");
 
             Run("ip", $"route add {serverIp}/32 via {gw} dev {iface}");
@@ -346,7 +354,16 @@ public sealed class VpnClient
         {
             Run("ip", $"route del {serverIp}/32 2>/dev/null || true");
             Run("ip", "route del default dev vpn0 2>/dev/null || true");
-            Run("systemctl", "restart NetworkManager");
+            if (!string.IsNullOrEmpty(_savedGateway) && !string.IsNullOrEmpty(_savedIface))
+            {
+                Run("ip", $"route add default via {_savedGateway} dev {_savedIface}");
+                Console.WriteLine($"Default route restored: via {_savedGateway} dev {_savedIface}");
+            }
+            else
+            {
+                // Fallback — перезапуск NetworkManager
+                Run("systemctl", "restart NetworkManager");
+            }
             Console.WriteLine("Routes restored.");
         }
     }
