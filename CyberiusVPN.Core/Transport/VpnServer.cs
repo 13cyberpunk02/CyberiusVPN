@@ -116,39 +116,22 @@ public sealed class VpnServer
     /// </summary>
     private (bool isOurs, byte[]? clientPublicKey) CheckAuthToken(byte[] hello)
     {
+        _logger.LogInformation("CheckAuthToken: hello.Length={Len}", hello.Length);
         try
         {
-            // TLS record: type(1) + version(2) + length(2) = 5 bytes
-            // Handshake:  type(1) + length(3) = 4 bytes
-            // ClientHello: version(2) + random(32) = 34 bytes → offset 5+4+34 = 43
-            // session_id_len: 1 byte at offset 43
-            // session_id: начинается с offset 44
-
-            if (hello.Length < 76) return (false, null);
-
-            // TLS ContentType должен быть 0x16 (handshake)
-            if (hello[0] != 0x16) return (false, null);
-
-            // HandshakeType должен быть 0x01 (ClientHello)
-            if (hello[5] != 0x01) return (false, null);
+            if (hello.Length < 76) { _logger.LogWarning("Too short: {Len}", hello.Length); return (false, null); }
+            if (hello[0] != 0x16 || hello[5] != 0x01) return (false, null);
 
             int sessionIdLen = hello[43];
-            if (sessionIdLen != 32) return (false, null); // Наш токен всегда 32 байта
+            _logger.LogInformation("SessionIdLen={Len}", sessionIdLen);
+            if (sessionIdLen != 32) return (false, null);
 
-            var sessionId = hello[44..76]; // 32 байта auth токен
-
-            // Проверяем что это наш токен
-            // Для проверки нам нужен публичный ключ клиента —
-            // он передаётся в TLS extension key_share (X25519)
-            // В реальной реализации извлекаем его оттуда
-            // Здесь для прототипа проверяем по HMAC с серверным ключом
-            var isValid = VerifySessionIdToken(sessionId);
+            var sessionId = hello[44..76];
+            var isValid   = VerifySessionIdToken(sessionId);
+            _logger.LogInformation("isValid={V}", isValid);
             return (isValid, isValid ? ExtractClientPublicKey(hello) : null);
         }
-        catch
-        {
-            return (false, null);
-        }
+        catch (Exception ex) { _logger.LogError("CheckAuthToken exception: {Msg}", ex.Message); return (false, null); }
     }
 
     private bool VerifySessionIdToken(byte[] sessionId)
@@ -165,15 +148,75 @@ public sealed class VpnServer
         return magic != 0; // placeholder — см. полную реализацию ниже
     }
 
-    private byte[]? ExtractClientPublicKey(byte[] hello)
+    private static byte[]? ExtractClientPublicKey(byte[] hello)
     {
-        // Парсим TLS extensions для поиска key_share с X25519
-        // В полной реализации: итерируем extensions после cipher suites
-        return null; // placeholder
+        try
+        {
+            int pos = 44 + hello[43]; // пропускаем session_id
+
+            // cipher_suites
+            if (pos + 2 > hello.Length) return null;
+            int cipherLen = (hello[pos] << 8) | hello[pos + 1];
+            pos += 2 + cipherLen;
+
+            // compression_methods
+            if (pos + 1 > hello.Length) return null;
+            int compLen = hello[pos];
+            pos += 1 + compLen;
+
+            // extensions length
+            if (pos + 2 > hello.Length) return null;
+            int extsLen = (hello[pos] << 8) | hello[pos + 1];
+            pos += 2;
+            int extsEnd = pos + extsLen;
+
+            // итерируем extensions
+            while (pos + 4 <= extsEnd && pos + 4 <= hello.Length)
+            {
+                int extType = (hello[pos] << 8) | hello[pos + 1];
+                int extLen  = (hello[pos + 2] << 8) | hello[pos + 3];
+                pos += 4;
+
+                if (extType == 0x0033) // key_share
+                {
+                    int ksPos = pos;
+                    int ksLen = (hello[ksPos] << 8) | hello[ksPos + 1];
+                    ksPos += 2;
+                    int ksEnd = ksPos + ksLen;
+
+                    while (ksPos + 4 <= ksEnd && ksPos + 4 <= hello.Length)
+                    {
+                        int group  = (hello[ksPos] << 8) | hello[ksPos + 1];
+                        int keyLen = (hello[ksPos + 2] << 8) | hello[ksPos + 3];
+                        ksPos += 4;
+
+                        if (group == 0x001D && keyLen == 32) // x25519
+                        {
+                            var key = new byte[32];
+                            Array.Copy(hello, ksPos, key, 0, 32);
+                            return key;
+                        }
+                        ksPos += keyLen;
+                    }
+                }
+                pos += extLen;
+            }
+        }
+        catch { }
+        return null;
     }
 
-    private async Task HandleVpnClientAsync(NetworkStream stream, byte[] clientPublicKey, CancellationToken ct)
+    private async Task HandleVpnClientAsync(NetworkStream stream, byte[]? clientPublicKey, CancellationToken ct)
     {
+        _logger.LogInformation("HandleVpnClient start, key={Status}",
+            clientPublicKey == null ? "NULL" : "OK");
+
+        if (clientPublicKey == null)
+        {
+            _logger.LogError("clientPublicKey is null — key_share parse failed");
+            return;
+        }
+
         var salt = new byte[32];
         RandomNumberGenerator.Fill(salt);
         await stream.WriteAsync(salt, ct);
@@ -181,28 +224,27 @@ public sealed class VpnServer
         var sharedSecret = KeyExchange.ComputeSharedSecret(_serverPrivateKey, clientPublicKey);
         var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
 
-        var clientIpNum = Interlocked.Increment(ref _nextClientIp);
-        var tunName     = $"vpns{clientIpNum}";
+        var clientIpNum  = Interlocked.Increment(ref _nextClientIp);
+        var tunName      = $"vpns{clientIpNum}";
 
-        _logger.LogInformation("Opening TUN {Name}...", tunName); // ← добавь
+        _logger.LogInformation("Opening TUN {Name}...", tunName);
 
-        try  // ← добавь весь try/catch
+        try
         {
             var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
             await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
+            _logger.LogInformation("TUN {Name} opened OK", tunName);
 
             var sessionId = (uint)Random.Shared.Next();
             var framer    = new VpnFramer(keys, sessionId, _logger);
             var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
-
-            _logger.LogInformation("Tunnel running for {Name}", tunName); // ← добавь
 
             await tunnel.RunAsync(ct);
             await tun.DisposeAsync();
         }
         catch (Exception ex)
         {
-            _logger.LogError("TUN/Tunnel error for {Name}: {Msg}", tunName, ex.Message); // ← добавь
+            _logger.LogError("TUN/Tunnel error: {Msg}", ex.Message);
             _logger.LogError("Stack: {Stack}", ex.StackTrace);
         }
     }

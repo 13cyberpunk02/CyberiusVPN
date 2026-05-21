@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using CyberiusVPN.Core.Crypto;
@@ -59,45 +60,63 @@ public sealed class VpnClient
     {
         using var tcp = new TcpClient();
         tcp.NoDelay  = true;
-
+        
         await tcp.ConnectAsync(_config.ServerHost, _config.ServerPort, ct);
         _logger.LogInformation("TCP connected");
+        
+        try
+        {
+            await using var stream = tcp.GetStream();
 
-        using var stream = tcp.GetStream();
+            // 1. Строим auth токен
+            var authToken = RealityHandshake.BuildAuthToken(_clientPrivateKey, _serverPublicKey);
 
-        // 1. Строим auth токен
-        var authToken = RealityHandshake.BuildAuthToken(_clientPrivateKey, _serverPublicKey);
+            // 2. Делаем TLS-подобный handshake с Chrome fingerprint
+            //    auth токен едет в session_id поле
+            await SendRealityClientHelloAsync(stream, authToken, ct);
 
-        // 2. Делаем TLS-подобный handshake с Chrome fingerprint
-        //    auth токен едет в session_id поле
-        await SendRealityClientHelloAsync(stream, authToken, ct);
+            // 3. Получаем соль для деривации ключей от сервера
+            var salt = new byte[32];
+            await ReadExactAsync(stream, salt, ct);
 
-        // 3. Получаем соль для деривации ключей от сервера
-        var salt = new byte[32];
-        await ReadExactAsync(stream, salt, ct);
+            // 4. Вычисляем ключи сессии
+            var sharedSecret = KeyExchange.ComputeSharedSecret(_clientPrivateKey, _serverPublicKey);
+            var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
 
-        // 4. Вычисляем ключи сессии
-        var sharedSecret = KeyExchange.ComputeSharedSecret(_clientPrivateKey, _serverPublicKey);
-        var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
+            _logger.LogInformation("Session keys derived, opening TUN...");
 
-        _logger.LogInformation("Session keys derived, opening TUN...");
+            // 5. Открываем TUN
+            var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
+            await tun.OpenAsync("vpn0", _config.TunAddress, _config.TunMask, _config.Mtu);
 
-        // 5. Открываем TUN
-        var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
-        await tun.OpenAsync("vpn0", _config.TunAddress, _config.TunMask, _config.Mtu);
+            // 6. Настраиваем маршруты
+            SetupRoutes(_config.ServerHost, _config.TunAddress);
 
-        // 6. Настраиваем маршруты
-        SetupRoutes(_config.ServerHost, _config.TunAddress);
+            // 7. Запускаем туннель
+            var sessionId = (uint)Random.Shared.Next();
+            var framer    = new VpnFramer(keys, sessionId, _logger);
+            var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
 
-        // 7. Запускаем туннель
-        var sessionId = (uint)Random.Shared.Next();
-        var framer    = new VpnFramer(keys, sessionId, _logger);
-        var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
-
-        _logger.LogInformation("VPN connected! Routing traffic through tunnel.");
-        await tunnel.RunAsync(ct);
-
-        await tun.DisposeAsync();
+            _logger.LogInformation("VPN connected! Routing traffic through tunnel.");
+            await tunnel.RunAsync(ct);
+            await tun.DisposeAsync();
+        }
+        finally
+        {
+            // Восстанавливаем маршруты при любом выходе
+            CleanupRoutes(_config.ServerHost);
+        }
+    }
+    
+    private static void CleanupRoutes(string serverHost)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            Run("ip", "route del default dev vpn0 2>/dev/null || true");
+            return;
+        }
+        Run("route", $"delete {serverHost} mask 255.255.255.255");
+        Console.WriteLine("Routes restored.");
     }
 
     /// <summary>
@@ -112,11 +131,11 @@ public sealed class VpnClient
     private async Task SendRealityClientHelloAsync(Stream stream, byte[] authToken, CancellationToken ct)
     {
         using var ms  = new MemoryStream();
-        using var w   = new BinaryWriter(ms);
+        await using var w   = new BinaryWriter(ms);
 
         // === ClientHello body ===
         using var helloMs = new MemoryStream();
-        using var hw      = new BinaryWriter(helloMs);
+        await using var hw      = new BinaryWriter(helloMs);
 
         // Client version: TLS 1.2 (0x0303) — в TLS 1.3 реальная версия в extension
         hw.Write((byte)0x03);
@@ -222,20 +241,45 @@ public sealed class VpnClient
 
     private static void SetupRoutes(string serverHost, string tunAddress)
     {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            // Сначала удаляем старый маршрут если есть — игнорируем ошибку
-            Run("route", $"delete {serverHost}");
-            Run("route", "delete 0.0.0.0 mask 0.0.0.0");
-
-            // Добавляем заново
-            Run("route", $"add 0.0.0.0 mask 0.0.0.0 {tunAddress} metric 5");
-        }
-        else
-        {
-            Run("ip", "route del default dev vpn0 2>/dev/null || true");
             Run("ip", "route add default dev vpn0");
+            return;
         }
+        var gw = GetDefaultGateway();
+        Console.WriteLine($"Default gateway: {gw}");
+        Run("route", $"delete {serverHost} mask 255.255.255.255");
+        Run("route", $"add {serverHost} mask 255.255.255.255 {gw} metric 1");
+    }
+    
+    private static string GetDefaultGateway()
+    {
+        try
+        {
+            // Читаем таблицу маршрутов и берём шлюз по умолчанию
+            var psi = new System.Diagnostics.ProcessStartInfo("route", "print 0.0.0.0")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            };
+            var p      = System.Diagnostics.Process.Start(psi)!;
+            var output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit();
+
+            // Ищем строку вида: "0.0.0.0  0.0.0.0  192.168.0.1  ..."
+            foreach (var line in output.Split('\n'))
+            {
+                var parts = line.Trim().Split([' ','\t'], 
+                    StringSplitOptions.RemoveEmptyEntries);
+                if (parts is ["0.0.0.0", "0.0.0.0", _, ..]
+                    && IPAddress.TryParse(parts[2], out _))
+                {
+                    return parts[2];
+                }
+            }
+        }
+        catch { }
+        return "";
     }
 
     private static void Run(string cmd, string args)
