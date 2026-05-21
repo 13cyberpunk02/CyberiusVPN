@@ -21,11 +21,11 @@ namespace CyberiusVPN.Core.Transport;
 /// </summary>
 public sealed class VpnServer
 {
-    private readonly ServerConfig   _config;
-    private readonly ILogger        _logger;
+    private readonly ServerConfig _config;
+    private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
-    private readonly byte[]         _serverPrivateKey;
-    private readonly byte[]         _serverPublicKey;
+    private readonly byte[] _serverPrivateKey;
+    private readonly byte[] _serverPublicKey;
 
     /// <summary>Атомарный счётчик для назначения уникальных IP клиентам.</summary>
     private int _nextClientIp = 2;
@@ -37,11 +37,11 @@ public sealed class VpnServer
     /// <param name="loggerFactory">Фабрика логгеров.</param>
     public VpnServer(ServerConfig config, ILoggerFactory loggerFactory)
     {
-        _config           = config;
-        _loggerFactory    = loggerFactory;
-        _logger           = loggerFactory.CreateLogger<VpnServer>();
+        _config = config;
+        _loggerFactory = loggerFactory;
+        _logger = loggerFactory.CreateLogger<VpnServer>();
         _serverPrivateKey = KeyExchange.FromBase64(config.PrivateKey);
-        _serverPublicKey  = X25519PublicFromPrivate(_serverPrivateKey);
+        _serverPublicKey = X25519PublicFromPrivate(_serverPrivateKey);
     }
 
     /// <summary>
@@ -50,6 +50,7 @@ public sealed class VpnServer
     /// <param name="ct">Токен отмены.</param>
     public async Task RunAsync(CancellationToken ct)
     {
+        CleanupOldTunInterfaces();
         var endpoint = new IPEndPoint(IPAddress.Any, _config.ListenPort);
         var listener = new TcpListener(endpoint);
         listener.Start();
@@ -64,6 +65,40 @@ public sealed class VpnServer
             _ = HandleClientAsync(client, ct);
         }
     }
+
+    private static void CleanupOldTunInterfaces()
+    {
+        try
+        {
+            // Удаляем все vpns* интерфейсы
+            var result = RunAndRead("ip", "link show");
+            foreach (var line in result.Split('\n'))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(line, @"\d+:\s+(vpns\d+):");
+                if (!match.Success) continue;
+                var name = match.Groups[1].Value;
+                RunCmd("ip", $"link del {name}");
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private static string RunAndRead(string cmd, string args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(cmd, args)
+        {
+            RedirectStandardOutput = true,
+            UseShellExecute = false
+        };
+        var p = System.Diagnostics.Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd();
+        p.WaitForExit();
+        return output;
+    }
+
 
     /// <summary>Обрабатывает одно входящее TCP соединение.</summary>
     private async Task HandleClientAsync(TcpClient tcp, CancellationToken ct)
@@ -103,7 +138,7 @@ public sealed class VpnServer
     /// <summary>Читает первые 512 байт TCP потока — TLS ClientHello.</summary>
     private static async Task<byte[]> PeekClientHelloAsync(NetworkStream stream, CancellationToken ct)
     {
-        var buf  = new byte[512];
+        var buf = new byte[512];
         int read = await stream.ReadAsync(buf.AsMemory(0, 512), ct);
         return buf[..read];
     }
@@ -116,9 +151,9 @@ public sealed class VpnServer
     {
         try
         {
-            if (hello.Length < 76)  return (false, null);
-            if (hello[0] != 0x16)   return (false, null); // TLS record
-            if (hello[5] != 0x01)   return (false, null); // ClientHello
+            if (hello.Length < 76) return (false, null);
+            if (hello[0] != 0x16) return (false, null); // TLS record
+            if (hello[5] != 0x01) return (false, null); // ClientHello
 
             int sessionIdLen = hello[43];
             if (sessionIdLen != 32) return (false, null);
@@ -175,7 +210,7 @@ public sealed class VpnServer
             while (pos + 4 <= extsEnd && pos + 4 <= hello.Length)
             {
                 int extType = (hello[pos] << 8) | hello[pos + 1];
-                int extLen  = (hello[pos + 2] << 8) | hello[pos + 3];
+                int extLen = (hello[pos + 2] << 8) | hello[pos + 3];
                 pos += 4;
 
                 if (extType == 0x0033) // key_share
@@ -187,7 +222,7 @@ public sealed class VpnServer
 
                     while (ksPos + 4 <= ksEnd && ksPos + 4 <= hello.Length)
                     {
-                        int group  = (hello[ksPos] << 8) | hello[ksPos + 1];
+                        int group = (hello[ksPos] << 8) | hello[ksPos + 1];
                         int keyLen = (hello[ksPos + 2] << 8) | hello[ksPos + 3];
                         ksPos += 4;
 
@@ -197,9 +232,11 @@ public sealed class VpnServer
                             Array.Copy(hello, ksPos, key, 0, 32);
                             return key;
                         }
+
                         ksPos += keyLen;
                     }
                 }
+
                 pos += extLen;
             }
         }
@@ -228,11 +265,11 @@ public sealed class VpnServer
         RandomNumberGenerator.Fill(salt);
         // clientIpNum вычисляем ЗДЕСЬ (до отправки), чтобы сразу отправить клиенту
         var clientIpNum = Interlocked.Increment(ref _nextClientIp);
-        var assignedIp  = $"10.8.0.{clientIpNum}";
-        var tunName     = $"vpns{clientIpNum}";
+        var assignedIp = $"10.8.0.{clientIpNum}";
+        var tunName = $"vpns{clientIpNum}";
 
         // Отправляем клиенту: [32 байта salt] + [4 байта IP]
-        var ipBytes   = IPAddress.Parse(assignedIp).GetAddressBytes();
+        var ipBytes = IPAddress.Parse(assignedIp).GetAddressBytes();
         var handshake = new byte[36];
         salt.CopyTo(handshake, 0);
         ipBytes.CopyTo(handshake, 32);
@@ -240,15 +277,15 @@ public sealed class VpnServer
 
         // 2. Деривируем ключи с той же солью
         var sharedSecret = KeyExchange.ComputeSharedSecret(_serverPrivateKey, clientPublicKey);
-        var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
+        var keys = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
 
         // Инвертируем ключи для серверной стороны:
         // Клиент: Send=A, Recv=B → Сервер: Send=B, Recv=A
         var serverKeys = new SessionKeys(
             SendKey: keys.RecvKey,
             RecvKey: keys.SendKey,
-            SendIv:  keys.RecvIv,
-            RecvIv:  keys.SendIv
+            SendIv: keys.RecvIv,
+            RecvIv: keys.SendIv
         );
 
         // 3. Уникальный IP для этого клиента через атомарный счётчик
@@ -279,16 +316,16 @@ public sealed class VpnServer
             await tun.DisposeAsync();
         }
     }
-    
+
     private static void RunCmd(string cmd, string args)
     {
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
-            FileName               = cmd,
-            Arguments              = args,
+            FileName = cmd,
+            Arguments = args,
             RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            UseShellExecute        = false
+            RedirectStandardError = true,
+            UseShellExecute = false
         })?.WaitForExit();
     }
 
@@ -340,8 +377,8 @@ public sealed class VpnServer
     /// <summary>Вычисляет публичный ключ X25519 из приватного.</summary>
     private static byte[] X25519PublicFromPrivate(byte[] privateKey)
     {
-        var priv  = new Org.BouncyCastle.Crypto.Parameters.X25519PrivateKeyParameters(privateKey, 0);
-        var pub   = priv.GeneratePublicKey();
+        var priv = new Org.BouncyCastle.Crypto.Parameters.X25519PrivateKeyParameters(privateKey, 0);
+        var pub = priv.GeneratePublicKey();
         var bytes = new byte[32];
         pub.Encode(bytes, 0);
         return bytes;
