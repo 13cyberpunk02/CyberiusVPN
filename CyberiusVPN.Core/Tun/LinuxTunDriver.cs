@@ -14,6 +14,7 @@ internal sealed class LinuxTunDriver : ITunDriver
 {
     private readonly ILogger _logger;
     private FileStream?      _stream;
+    private string _name = "";
 
     [DllImport("libc", SetLastError = true)]
     private static extern int ioctl(int fd, uint request, ref IfReq ifr);
@@ -40,6 +41,7 @@ internal sealed class LinuxTunDriver : ITunDriver
 
     public Task OpenAsync(string name, string address, string mask, int mtu)
     {
+        _name = name;
         int fd = open("/dev/net/tun", O_RDWR);
         if (fd < 0)
             throw new IOException($"Cannot open /dev/net/tun (run as root?), errno={Marshal.GetLastWin32Error()}");
@@ -109,5 +111,7 @@ internal sealed class LinuxTunDriver : ITunDriver
     public async ValueTask DisposeAsync()
     {
         if (_stream != null) await _stream.DisposeAsync();
+        if (!string.IsNullOrEmpty(_name))
+            Run("ip", $"link del {_name}");
     }
 }
