@@ -25,8 +25,8 @@ VPN с Reality-подобным handshake на C# / .NET 10.
 | Компонент        | Алгоритм                  |
 |------------------|---------------------------|
 | Key exchange     | X25519 (BouncyCastle)     |
-| KDF              | HKDF-SHA256 (.NET 8)      |
-| Шифрование       | AES-256-GCM (.NET 8)      |
+| KDF              | HKDF-SHA256 (.NET 10)      |
+| Шифрование       | AES-256-GCM (.NET 10)      |
 | TLS fingerprint  | Chrome 120 (ручная сборка)|
 | Auth токен       | X25519 + HKDF + timestamp |
 
@@ -34,7 +34,7 @@ VPN с Reality-подобным handshake на C# / .NET 10.
 
 ### 1. Требования
 
-- .NET 8 SDK
+- .NET 10 SDK
 - Linux сервер (VPS): root, Docker
 - Windows клиент: Администратор, wintun.dll
 
