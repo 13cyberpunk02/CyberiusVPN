@@ -4,29 +4,43 @@ using Org.BouncyCastle.Tls.Crypto.Impl.BC;
 namespace CyberiusVPN.Core.Protocol;
 
 /// <summary>
-/// TLS клиент с Chrome fingerprint + auth токен в session_id.
-/// Наследует DefaultTlsClient (BouncyCastle) и переопределяет нужные методы.
+/// TLS клиент BouncyCastle с Chrome 120 fingerprint.
+/// Переопределяет cipher suites, SNI и session_id для вставки auth-токена.
 /// </summary>
-public sealed class RealityTlsClient(BcTlsCrypto crypto, string sniDomain, byte[] authToken) : DefaultTlsClient(crypto)
+public sealed class RealityTlsClient : DefaultTlsClient
 {
+    private readonly string _sniDomain;
+    private readonly byte[] _authToken;
+
+    /// <param name="crypto">BouncyCastle криптопровайдер.</param>
+    /// <param name="sniDomain">SNI домен для маскировки (например www.microsoft.com).</param>
+    /// <param name="authToken">32-байтный auth-токен для session_id.</param>
+    public RealityTlsClient(BcTlsCrypto crypto, string sniDomain, byte[] authToken)
+        : base(crypto)
+    {
+        _sniDomain = sniDomain;
+        _authToken = authToken;
+    }
+
+    /// <inheritdoc/>
     public override int[] GetCipherSuites() => ChromeFingerprint.CipherSuites;
 
+    /// <inheritdoc/>
     protected override IList<ServerName> GetSniServerNames()
         => [new ServerName(NameType.host_name,
-            System.Text.Encoding.ASCII.GetBytes(sniDomain))];
+            System.Text.Encoding.ASCII.GetBytes(_sniDomain))];
 
     /// <summary>
-    /// Прячем auth токен в legacy_session_id (32 байта).
-    /// В TLS 1.3 это поле игнорируется обычным TLS сервером,
-    /// но наш VPN-сервер читает его ДО TLS handshake через сырой peek.
+    /// Возвращает фейковую сессию с auth-токеном в качестве session_id.
+    /// В TLS 1.3 поле legacy_session_id игнорируется TLS-стеком,
+    /// но наш сервер читает его до handshake из сырого TCP потока.
     /// </summary>
     public override TlsSession GetSessionToResume()
-        => new FakeSession(authToken);
+        => new FakeSession(_authToken);
 
     /// <summary>
-    /// Обязательный абстрактный метод из AbstractTlsClient.
-    /// Возвращаем анонимную аутентификацию — мы аутентифицируемся
-    /// через session_id токен, а не через клиентский TLS сертификат.
+    /// Анонимная аутентификация — мы аутентифицируемся через X25519 токен,
+    /// а не через клиентский TLS сертификат.
     /// </summary>
     public override TlsAuthentication GetAuthentication()
         => new AnonymousTlsAuthentication();

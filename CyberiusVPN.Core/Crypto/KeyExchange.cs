@@ -6,10 +6,14 @@ using Org.BouncyCastle.Security;
 namespace CyberiusVPN.Core.Crypto;
 
 /// <summary>
-/// X25519 Diffie-Hellman — обмен ключами
+/// X25519 Diffie-Hellman — обмен ключами.
+/// Используется для выработки общего секрета между клиентом и сервером
+/// без передачи приватных ключей по сети.
 /// </summary>
 public static class KeyExchange
 {
+    /// <summary>Генерирует новую пару ключей X25519.</summary>
+    /// <returns>Кортеж (privateKey, publicKey), каждый по 32 байта.</returns>
     public static (byte[] privateKey, byte[] publicKey) GenerateKeyPair()
     {
         var generator = new X25519KeyPairGenerator();
@@ -25,6 +29,13 @@ public static class KeyExchange
         return (privateKey, publicKey);
     }
 
+    /// <summary>
+    /// Вычисляет общий секрет ECDH.
+    /// Свойство: ECDH(privA, pubB) == ECDH(privB, pubA)
+    /// </summary>
+    /// <param name="privateKey">Приватный ключ локальной стороны (32 байта).</param>
+    /// <param name="remotePublicKey">Публичный ключ удалённой стороны (32 байта).</param>
+    /// <returns>Общий секрет 32 байта.</returns>
     public static byte[] ComputeSharedSecret(byte[] privateKey, byte[] remotePublicKey)
     {
         var agreement  = new X25519Agreement();
@@ -37,6 +48,9 @@ public static class KeyExchange
         return secret;
     }
 
+    /// <summary>Кодирует ключ в Base64 строку для хранения в конфиге.</summary>
     public static string ToBase64(byte[] key) => Convert.ToBase64String(key);
+
+    /// <summary>Декодирует ключ из Base64 строки.</summary>
     public static byte[] FromBase64(string key) => Convert.FromBase64String(key);
 }

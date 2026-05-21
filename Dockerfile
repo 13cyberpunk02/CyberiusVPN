@@ -26,6 +26,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=build /app .
 
-EXPOSE 3443
+EXPOSE 443
 
 ENTRYPOINT ["dotnet", "CyberiusVPN.Server.dll"]

@@ -3,13 +3,19 @@ using Microsoft.Extensions.Logging;
 
 namespace CyberiusVPN.Core.Tun;
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // WINDOWS: WinTun API
 // Скачать wintun.dll: https://www.wintun.net/
-// ─────────────────────────────────────────────
+// Требует запуска от Администратора
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// Windows TUN драйвер через WinTun API.
+/// wintun.dll должен находиться рядом с исполняемым файлом.
+/// Требует прав Администратора.
+/// </summary>
 internal sealed class WindowsTunDriver(ILogger logger) : ITunDriver
 {
-    // WinTun P/Invoke
     [DllImport("wintun.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr WintunCreateAdapter(
         [MarshalAs(UnmanagedType.LPWStr)] string name,
@@ -40,7 +46,10 @@ internal sealed class WindowsTunDriver(ILogger logger) : ITunDriver
     [DllImport("wintun.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern void WintunCloseAdapter(IntPtr adapter);
 
-    private const uint WINTUN_MIN_RING_CAPACITY = 0x20000;   // 128 KB
+    [DllImport("kernel32.dll")]
+    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+    private const uint WINTUN_MIN_RING_CAPACITY = 0x20000; // 128 KB
 
     private IntPtr _adapter;
     private IntPtr _session;
@@ -48,15 +57,14 @@ internal sealed class WindowsTunDriver(ILogger logger) : ITunDriver
 
     public Task OpenAsync(string name, string address, string mask, int mtu)
     {
-        var guid     = Guid.NewGuid();
-        _adapter     = WintunCreateAdapter(name, "VPN", ref guid);
+        var guid = Guid.NewGuid();
+        _adapter = WintunCreateAdapter(name, "VPN", ref guid);
         if (_adapter == IntPtr.Zero)
             throw new Exception("WintunCreateAdapter failed. Is wintun.dll present? Run as Administrator?");
 
         _session   = WintunStartSession(_adapter, WINTUN_MIN_RING_CAPACITY);
         _waitEvent = WintunGetReadWaitEvent(_session);
 
-        // Настраиваем IP через netsh
         ConfigureInterface(name, address, mask, mtu);
 
         logger.LogInformation("Windows WinTun {Name} configured", name);
@@ -65,57 +73,46 @@ internal sealed class WindowsTunDriver(ILogger logger) : ITunDriver
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
     {
-        RunCommand("netsh", $"interface ip set address name=\"{name}\" static {address} {mask}");
-        RunCommand("netsh", $"interface ipv4 set subinterface \"{name}\" mtu={mtu} store=persistent");
+        Run("netsh", $"interface ip set address name=\"{name}\" static {address} {mask}");
+        Run("netsh", $"interface ipv4 set subinterface \"{name}\" mtu={mtu} store=persistent");
     }
 
-    private static void RunCommand(string cmd, string args)
+    private static void Run(string cmd, string args)
     {
-        var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
-            FileName = cmd, Arguments = args,
-            RedirectStandardOutput = true, RedirectStandardError = true,
-            UseShellExecute = false
-        })!;
-        p.WaitForExit();
+            FileName               = cmd,
+            Arguments              = args,
+            RedirectStandardOutput = true,
+            UseShellExecute        = false
+        })?.WaitForExit();
     }
 
-    public unsafe Task<byte[]> ReadPacketAsync(CancellationToken ct)
+    public Task<byte[]> ReadPacketAsync(CancellationToken ct) => Task.Run(() =>
     {
-        return Task.Run(() =>
+        while (!ct.IsCancellationRequested)
         {
-            // Ждём пакет через WinTun event
-            while (!ct.IsCancellationRequested)
+            var ptr = WintunReceivePacket(_session, out uint size);
+            if (ptr != IntPtr.Zero)
             {
-                var ptr = WintunReceivePacket(_session, out uint size);
-                if (ptr != IntPtr.Zero)
-                {
-                    var data = new byte[size];
-                    Marshal.Copy(ptr, data, 0, (int)size);
-                    WintunReleaseReceivePacket(_session, ptr);
-                    return data;
-                }
-                // Ждём event вместо busy loop
-                WaitForSingleObject(_waitEvent, 100);
+                var data = new byte[size];
+                Marshal.Copy(ptr, data, 0, (int)size);
+                WintunReleaseReceivePacket(_session, ptr);
+                return data;
             }
-            ct.ThrowIfCancellationRequested();
-            return Array.Empty<byte>();
-        }, ct);
-    }
+            WaitForSingleObject(_waitEvent, 100);
+        }
+        ct.ThrowIfCancellationRequested();
+        return Array.Empty<byte>();
+    }, ct);
 
-    public unsafe Task WritePacketAsync(byte[] packet, CancellationToken ct)
+    public Task WritePacketAsync(byte[] packet, CancellationToken ct) => Task.Run(() =>
     {
         var ptr = WintunAllocateSendPacket(_session, (uint)packet.Length);
-        if (ptr == IntPtr.Zero)
-            return Task.CompletedTask; // ring buffer полный — пропускаем пакет
-
+        if (ptr == IntPtr.Zero) return; // ring buffer полон — пропускаем
         Marshal.Copy(packet, 0, ptr, packet.Length);
         WintunSendPacket(_session, ptr);
-        return Task.CompletedTask;
-    }
-
-    [DllImport("kernel32.dll")]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    }, ct);
 
     public ValueTask DisposeAsync()
     {

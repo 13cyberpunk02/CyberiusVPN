@@ -44,7 +44,7 @@ log "Server PID: $SERVER_PID"
 log "Starting client..."
 
 export VPN_SERVER="127.0.0.1"
-export VPN_PORT=3443
+export VPN_PORT=9443
 export VPN_SERVER_PUBKEY="$SERVER_PUBKEY"
 export VPN_CLIENT_PRIVKEY="$CLIENT_PRIVKEY"
 export VPN_SNI="www.microsoft.com"

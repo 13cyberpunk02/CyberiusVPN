@@ -1,17 +1,22 @@
 namespace CyberiusVPN.Core.Models;
 
 /// <summary>
-/// Заголовок пакета нашего протокола
-/// [4] Magic | [1] Type | [4] SessionId | [8] Nonce | [N] Payload | [16] Tag
+/// Заголовок кадра протокола туннеля.
+/// Формат: [4] Magic | [1] Type | [4] SessionId | [4] PayloadLen | [N] Ciphertext+Tag
 /// </summary>
 public record VpnPacketHeader(
-    uint      Magic,
+    uint       Magic,
     PacketType Type,
-    uint      SessionId,
-    ulong     Nonce
+    uint       SessionId,
+    ulong      Nonce
 )
 {
-    public const uint   MagicValue  = 0xC5_A3_F1_0E; // случайное, не похоже на известные протоколы
-    public const int    HeaderSize  = 4 + 1 + 4 + 8; // 17 байт
-    public const int    TagSize     = 16;
+    /// <summary>Магическое число для идентификации протокола.</summary>
+    public const uint MagicValue = 0xC5_A3_F1_0E;
+
+    /// <summary>Размер заголовка в байтах: Magic(4) + Type(1) + SessionId(4) + PayloadLen(4).</summary>
+    public const int HeaderSize = 4 + 1 + 4 + 4;
+
+    /// <summary>Размер GCM аутентификационного тега.</summary>
+    public const int TagSize = 16;
 }

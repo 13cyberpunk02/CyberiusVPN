@@ -4,19 +4,25 @@ using Microsoft.Extensions.Logging;
 namespace CyberiusVPN.Core.Protocol;
 
 /// <summary>
-/// Reality-подобный handshake.
-/// 
-/// Идея:
-/// 1. Клиент строит TLS ClientHello с fingerprint Chrome 120
-/// 2. В поле session_id прячем зашифрованный auth-токен (X25519)
-/// 3. Сервер смотрит на session_id:
-///    - Наш токен  → обрабатывает как VPN
-///    - Чужой      → форвардит на реальный SNI домен (microsoft.com и т.д.)
+/// Reality-подобный механизм аутентификации.
+///
+/// Идея: клиент строит TLS ClientHello с fingerprint Chrome 120
+/// и прячет auth-токен в поле legacy_session_id (32 байта).
+/// Сервер читает session_id до TLS handshake и решает:
+/// — наш клиент → VPN сессия
+/// — чужой → форвард к реальному SNI домену (маскировка)
+///
+/// Auth-токен = HKDF(ECDH(clientPriv, serverPub), timestamp, "reality-auth-v1")
+/// Окно проверки ±30 секунд для учёта рассинхрона часов.
 /// </summary>
-public sealed class RealityHandshake(ILogger logger)
+public sealed class RealityHandshake
 {
-    private readonly ILogger _logger = logger;
-
+    /// <summary>
+    /// Строит 32-байтный auth-токен для вставки в session_id ClientHello.
+    /// </summary>
+    /// <param name="clientPrivateKey">Приватный ключ клиента (32 байта).</param>
+    /// <param name="serverPublicKey">Публичный ключ сервера (32 байта).</param>
+    /// <returns>32-байтный токен.</returns>
     public static byte[] BuildAuthToken(byte[] clientPrivateKey, byte[] serverPublicKey)
     {
         var sharedSecret = Crypto.KeyExchange.ComputeSharedSecret(clientPrivateKey, serverPublicKey);
@@ -31,6 +37,14 @@ public sealed class RealityHandshake(ILogger logger)
         );
     }
 
+    /// <summary>
+    /// Проверяет auth-токен на сервере с окном ±30 секунд.
+    /// Использует константное время сравнения для защиты от timing-атак.
+    /// </summary>
+    /// <param name="token">Токен из session_id ClientHello.</param>
+    /// <param name="serverPrivateKey">Приватный ключ сервера.</param>
+    /// <param name="clientPublicKey">Публичный ключ клиента из key_share extension.</param>
+    /// <returns>True если токен валиден.</returns>
     public static bool VerifyAuthToken(byte[] token, byte[] serverPrivateKey, byte[] clientPublicKey)
     {
         var sharedSecret = Crypto.KeyExchange.ComputeSharedSecret(serverPrivateKey, clientPublicKey);

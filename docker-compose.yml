@@ -1,20 +1,25 @@
 services:
   vpn-server:
     build: .
-    container_name: cyberiusvpn-server
+    container_name: cyberiuspvpn-server
     restart: unless-stopped
+
+    # ВАЖНО: нужен для создания TUN интерфейса внутри контейнера
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
 
     ports:
-      - "3443:3443"
+      - "443:443"
 
     environment:
-      VPN_PORT:           "3443"
-      VPN_SNI:            "www.google.com"      
-      VPN_SERVER_PRIVKEY: "${VPN_SERVER_PRIVKEY}"    
+      VPN_PORT:           "443"
+      VPN_SNI:            "www.microsoft.com"
+      # Генерируй ключи командой: docker compose run vpn-server genkeys
+      VPN_SERVER_PRIVKEY: "${VPN_SERVER_PRIVKEY}"
+
+    # Форвардинг IP — нужен чтобы трафик клиентов шёл в интернет
     sysctls:
       - net.ipv4.ip_forward=1
 

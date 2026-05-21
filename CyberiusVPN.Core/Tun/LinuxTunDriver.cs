@@ -4,21 +4,27 @@ using Microsoft.Extensions.Logging;
 
 namespace CyberiusVPN.Core.Tun;
 
-internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
+/// <summary>
+/// Linux TUN драйвер через /dev/net/tun.
+/// Требует root или CAP_NET_ADMIN.
+/// FileStream открывается в синхронном режиме (TUN fd не поддерживает overlapped I/O),
+/// чтение/запись выполняются в Task.Run для не-блокирующей async работы.
+/// </summary>
+internal sealed class LinuxTunDriver : ITunDriver
 {
+    private readonly ILogger _logger;
     private FileStream?      _stream;
 
-    // P/Invoke для Linux ioctl
     [DllImport("libc", SetLastError = true)]
     private static extern int ioctl(int fd, uint request, ref IfReq ifr);
 
     [DllImport("libc", SetLastError = true)]
     private static extern int open([MarshalAs(UnmanagedType.LPStr)] string path, int flags);
 
-    private const uint TUNSETIFF   = 0x400454CA;
-    private const short IFF_TUN   = 0x0001;
-    private const short IFF_NO_PI = 0x1000;  // без packet info заголовка
-    private const int O_RDWR      = 2;
+    private const uint  TUNSETIFF  = 0x400454CA;
+    private const short IFF_TUN    = 0x0001;
+    private const short IFF_NO_PI  = 0x1000;
+    private const int   O_RDWR     = 2;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     private struct IfReq
@@ -30,11 +36,13 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         public byte[] Padding;
     }
 
+    public LinuxTunDriver(ILogger logger) => _logger = logger;
+
     public Task OpenAsync(string name, string address, string mask, int mtu)
     {
         int fd = open("/dev/net/tun", O_RDWR);
         if (fd < 0)
-            throw new IOException($"Cannot open /dev/net/tun. Run as root? errno={Marshal.GetLastWin32Error()}");
+            throw new IOException($"Cannot open /dev/net/tun (run as root?), errno={Marshal.GetLastWin32Error()}");
 
         var ifr = new IfReq
         {
@@ -46,24 +54,21 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         if (ioctl(fd, TUNSETIFF, ref ifr) < 0)
             throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
 
-        // SafeFileHandle из fd
-        var handle  = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream     = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
+        // Синхронный режим FileStream — TUN fd не поддерживает overlapped I/O
+        var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
+        _stream    = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
 
-        // Настраиваем IP адрес через ip команду
         ConfigureInterface(name, address, mask, mtu);
 
-        logger.LogInformation("Linux TUN {Name} configured", name);
+        _logger.LogInformation("Linux TUN {Name} configured", name);
         return Task.CompletedTask;
     }
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
     {
-        // Вычисляем prefix length из маски
         var prefixLen = MaskToCidr(mask);
-
-        RunCommand("ip", $"addr add {address}/{prefixLen} dev {name}");
-        RunCommand("ip", $"link set {name} mtu {mtu} up");
+        Run("ip", $"addr add {address}/{prefixLen} dev {name}");
+        Run("ip", $"link set {name} mtu {mtu} up");
     }
 
     private static int MaskToCidr(string mask)
@@ -75,34 +80,31 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         return bits;
     }
 
-    private static void RunCommand(string cmd, string args)
+    private static void Run(string cmd, string args)
     {
-        var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
-            FileName  = cmd, Arguments = args,
-            RedirectStandardOutput = true, RedirectStandardError = true
-        })!;
-        p.WaitForExit();
+            FileName               = cmd,
+            Arguments              = args,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false
+        })?.WaitForExit();
     }
 
-    public Task<byte[]> ReadPacketAsync(CancellationToken ct)
+    // Синхронное чтение в Task.Run — не блокирует thread pool
+    public Task<byte[]> ReadPacketAsync(CancellationToken ct) => Task.Run(() =>
     {
-        return Task.Run(() =>
-        {
-            var buf  = new byte[65535];
-            int read = _stream!.Read(buf, 0, buf.Length);
-            return buf[..read];
-        }, ct);
-    }
+        var buf  = new byte[65535];
+        int read = _stream!.Read(buf, 0, buf.Length);
+        return buf[..read];
+    }, ct);
 
-    public Task WritePacketAsync(byte[] packet, CancellationToken ct)
+    public Task WritePacketAsync(byte[] packet, CancellationToken ct) => Task.Run(() =>
     {
-        return Task.Run(() =>
-        {
-            _stream!.Write(packet, 0, packet.Length);
-            _stream.Flush();
-        }, ct);
-    }
+        _stream!.Write(packet, 0, packet.Length);
+        _stream.Flush();
+    }, ct);
 
     public async ValueTask DisposeAsync()
     {

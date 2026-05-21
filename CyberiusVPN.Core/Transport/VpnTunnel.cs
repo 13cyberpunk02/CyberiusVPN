@@ -4,74 +4,101 @@ using Microsoft.Extensions.Logging;
 namespace CyberiusVPN.Core.Transport;
 
 /// <summary>
-/// Пайплайн: TUN ↔ TCP туннель
-/// Два параллельных цикла: TUN → сервер, сервер → TUN
+/// Двунаправленный VPN туннель: TUN интерфейс ↔ зашифрованный TCP поток.
+///
+/// Три параллельных задачи:
+/// 1. Outbound: читает IP-пакеты из TUN, шифрует, отправляет на сервер
+/// 2. Inbound:  получает кадры от сервера, расшифровывает, пишет в TUN
+/// 3. Keepalive: каждые 25 секунд отправляет пустой пакет чтобы NAT не закрыл сессию
 /// </summary>
-public sealed class VpnTunnel(VpnFramer framer, Tun.TunInterface tun, Stream transport, ILogger logger)
+public sealed class VpnTunnel
 {
+    private readonly ILogger          _logger;
+    private readonly VpnFramer        _framer;
+    private readonly Tun.TunInterface _tun;
+    private readonly Stream           _transport;
+
+    /// <summary>
+    /// Создаёт туннель.
+    /// </summary>
+    /// <param name="framer">Framer для шифрования/расшифровки кадров.</param>
+    /// <param name="tun">TUN интерфейс для чтения/записи IP-пакетов.</param>
+    /// <param name="transport">TCP поток к удалённой стороне.</param>
+    /// <param name="logger">Логгер.</param>
+    public VpnTunnel(VpnFramer framer, Tun.TunInterface tun, Stream transport, ILogger logger)
+    {
+        _framer    = framer;
+        _tun       = tun;
+        _transport = transport;
+        _logger    = logger;
+    }
+
+    /// <summary>
+    /// Запускает все три задачи параллельно.
+    /// Первая завершившаяся задача останавливает остальные.
+    /// </summary>
+    /// <param name="ct">Токен отмены.</param>
     public async Task RunAsync(CancellationToken ct)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
 
-        logger.LogInformation("VPN tunnel started (session {Id:X8})", framer.SessionId);
+        _logger.LogInformation("VPN tunnel started (session {Id:X8})", _framer.SessionId);
 
         try
         {
-            // Запускаем три задачи, останавливаем все если одна упала
-            var outbound  = PumpOutboundAsync(cts.Token);
-            var inbound   = PumpInboundAsync(cts.Token);
-            var keepalive = KeepaliveLoopAsync(cts.Token);
-
-            // Первая завершившаяся задача останавливает остальные
-            await Task.WhenAny(outbound, inbound, keepalive);
+            await Task.WhenAny(
+                PumpOutboundAsync(cts.Token),
+                PumpInboundAsync(cts.Token),
+                KeepaliveLoopAsync(cts.Token)
+            );
         }
         finally
         {
             await cts.CancelAsync();
-            logger.LogInformation("VPN tunnel stopped");
+            _logger.LogInformation("VPN tunnel stopped");
         }
     }
 
-    // TUN → шифруем → сервер
+    /// <summary>TUN → шифруем → сервер.</summary>
     private async Task PumpOutboundAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            var packet = await tun.ReadPacketAsync(ct);
+            var packet = await _tun.ReadPacketAsync(ct);
             if (packet.Length == 0) continue;
 
-            await framer.SendPacketAsync(transport, packet, PacketType.Data, ct);
-            logger.LogTrace("→ {Bytes} bytes", packet.Length);
+            await _framer.SendPacketAsync(_transport, packet, PacketType.Data, ct);
+            _logger.LogTrace("→ {Bytes} bytes", packet.Length);
         }
     }
 
-    // сервер → расшифровываем → TUN
+    /// <summary>Сервер → расшифровываем → TUN.</summary>
     private async Task PumpInboundAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            var result = await framer.ReceivePacketAsync(transport, ct);
+            var result = await _framer.ReceivePacketAsync(_transport, ct);
             if (result is null) break;
 
             var (type, payload) = result.Value;
 
             if (type == PacketType.Data)
             {
-                await tun.WritePacketAsync(payload, ct);
-                logger.LogTrace("← {Bytes} bytes", payload.Length);
+                await _tun.WritePacketAsync(payload, ct);
+                _logger.LogTrace("← {Bytes} bytes", payload.Length);
             }
-            // Keepalive — просто игнорируем, главное что пришёл
+            // Keepalive — принимаем без действий
         }
     }
 
-    // Keepalive каждые 25 сек чтобы NAT не закрыл соединение
+    /// <summary>Keepalive каждые 25 секунд чтобы NAT не закрыл соединение.</summary>
     private async Task KeepaliveLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromSeconds(25), ct);
-            await framer.SendPacketAsync(transport, Array.Empty<byte>(), PacketType.Keepalive, ct);
-            logger.LogTrace("↔ keepalive");
+            await _framer.SendPacketAsync(_transport, Array.Empty<byte>(), PacketType.Keepalive, ct);
+            _logger.LogTrace("↔ keepalive");
         }
     }
 }
