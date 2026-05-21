@@ -92,8 +92,11 @@ public sealed class VpnClient
             await SendRealityClientHelloAsync(stream, authToken, ephPubKey, ct);
 
             // 4. Получаем соль от сервера
-            var salt = new byte[32];
-            await ReadExactAsync(stream, salt, ct);
+            var handshake  = new byte[36];
+            await ReadExactAsync(stream, handshake, ct);
+            var salt       = handshake[..32];
+            var assignedIp = new System.Net.IPAddress(handshake[32..36]).ToString();
+            _logger.LogInformation("Assigned IP: {Ip}", assignedIp);
 
             // 5. ECDH с эфемерным ключом → сессионные ключи
             var sharedSecret = KeyExchange.ComputeSharedSecret(ephPrivKey, _serverPublicKey);
@@ -103,7 +106,7 @@ public sealed class VpnClient
 
             // 6. Открываем TUN интерфейс
             var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
-            await tun.OpenAsync("vpn0", _config.TunAddress, _config.TunMask, _config.Mtu);
+            await tun.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
 
             // 7. Прописываем маршрут к серверу через реальный шлюз
             SetupRoutes(_config.ServerHost);
@@ -251,32 +254,75 @@ public sealed class VpnClient
     /// Прописывает маршрут к VPN серверу через реальный шлюз.
     /// Без этого трафик к серверу пойдёт через TUN и создаст петлю.
     /// </summary>
-    private static void SetupRoutes(string serverHost)
-    {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
-
-        var gw = GetDefaultGateway();
-        if (string.IsNullOrEmpty(gw))
-        {
-            Console.WriteLine("WARNING: Could not find default gateway");
-            return;
-        }
-
-        Console.WriteLine($"Default gateway: {gw}");
-        Run("route", $"delete {serverHost} mask 255.255.255.255");
-        Run("route", $"add {serverHost} mask 255.255.255.255 {gw} metric 1");
-    }
+   private static void SetupRoutes(string serverHost)
+   {
+       if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+       {
+           var gw = GetDefaultGateway();
+           if (string.IsNullOrEmpty(gw)) return;
+           Console.WriteLine($"Default gateway: {gw}");
+           Run("route", $"delete {serverHost} mask 255.255.255.255");
+           Run("route", $"add {serverHost} mask 255.255.255.255 {gw} metric 1");
+           Run("route", "delete 0.0.0.0 mask 128.0.0.0");
+           Run("route", "delete 128.0.0.0 mask 128.0.0.0");
+           Run("route", "add 0.0.0.0 mask 128.0.0.0 10.8.0.1 metric 5");
+           Run("route", "add 128.0.0.0 mask 128.0.0.0 10.8.0.1 metric 5");
+       }
+       else
+       {
+           // Узнаём реальный шлюз и интерфейс
+           var gwLine = RunAndRead("ip", "route show default");
+           // Формат: "default via 10.0.0.1 dev ens18 ..."
+           var parts = gwLine.Split(' ');
+           var gw    = parts.Length > 2 ? parts[2] : "";
+           var iface = parts.Length > 4 ? parts[4] : "";
+   
+           Console.WriteLine($"Default gateway: {gw} via {iface}");
+   
+           // Маршрут к VPN серверу напрямую — чтобы не было петли
+           Run("ip", $"route add {serverHost}/32 via {gw} dev {iface}");
+   
+           // Весь остальной трафик через TUN
+           Run("ip", "route del default");
+           Run("ip", "route add default dev vpn0");
+   
+           // DNS через Google (иначе имена не резолвятся)
+           Run("resolvectl", "dns vpn0 8.8.8.8 8.8.4.4");
+       }
+   }
 
     /// <summary>Удаляет добавленные маршруты при отключении.</summary>
     private static void CleanupRoutes(string serverHost)
     {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Run("ip", "route del default dev vpn0 2>/dev/null || true");
-            return;
+            Run("route", $"delete {serverHost} mask 255.255.255.255");
+            Run("route", "delete 0.0.0.0 mask 128.0.0.0");
+            Run("route", "delete 128.0.0.0 mask 128.0.0.0");
+            Console.WriteLine("Routes restored.");
         }
-        Run("route", $"delete {serverHost} mask 255.255.255.255");
-        Console.WriteLine("Routes restored.");
+        else
+        {
+            // Восстанавливаем дефолтный маршрут
+            Run("ip", $"route del {serverHost}/32");
+            Run("ip", "route del default dev vpn0");
+            Run("ip", "route add default via $(ip route | grep ens18 | grep -v default | awk '{print $1}' | head -1)");
+            Console.WriteLine("Routes restored.");
+        }
+    }
+    
+    // Читает stdout команды
+    private static string RunAndRead(string cmd, string args)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(cmd, args)
+        {
+            RedirectStandardOutput = true,
+            UseShellExecute = false
+        };
+        var p = System.Diagnostics.Process.Start(psi)!;
+        var output = p.StandardOutput.ReadLine() ?? "";
+        p.WaitForExit();
+        return output;
     }
 
     /// <summary>Читает шлюз по умолчанию из таблицы маршрутизации Windows.</summary>

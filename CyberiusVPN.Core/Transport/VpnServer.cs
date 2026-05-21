@@ -196,7 +196,11 @@ public sealed class VpnServer
                 pos += extLen;
             }
         }
-        catch { }
+        catch
+        {
+            // ignored
+        }
+
         return null;
     }
 
@@ -215,7 +219,17 @@ public sealed class VpnServer
         //    Клиент ждёт соль перед деривацией ключей
         var salt = new byte[32];
         RandomNumberGenerator.Fill(salt);
-        await stream.WriteAsync(salt, ct);
+        // clientIpNum вычисляем ЗДЕСЬ (до отправки), чтобы сразу отправить клиенту
+        var clientIpNum = Interlocked.Increment(ref _nextClientIp);
+        var assignedIp  = $"10.8.0.{clientIpNum}";
+        var tunName     = $"vpns{clientIpNum}";
+
+        // Отправляем клиенту: [32 байта salt] + [4 байта IP]
+        var ipBytes   = IPAddress.Parse(assignedIp).GetAddressBytes();
+        var handshake = new byte[36];
+        salt.CopyTo(handshake, 0);
+        ipBytes.CopyTo(handshake, 32);
+        await stream.WriteAsync(handshake, ct);
 
         // 2. Деривируем ключи с той же солью
         var sharedSecret = KeyExchange.ComputeSharedSecret(_serverPrivateKey, clientPublicKey);
@@ -231,16 +245,19 @@ public sealed class VpnServer
         );
 
         // 3. Уникальный IP для этого клиента через атомарный счётчик
-        var clientIpNum = Interlocked.Increment(ref _nextClientIp);
-        var tunName     = $"vpns{clientIpNum}";
-
-        _logger.LogInformation("Assigning TUN {Name} (10.8.0.{N})", tunName, clientIpNum);
+        _logger.LogInformation("Assigning TUN {Name} ({Ip})", tunName, assignedIp);
 
         try
         {
             // 4. Открываем TUN интерфейс для этого клиента
             var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
             await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
+            
+            await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
+
+            // Маршрут к клиенту через этот TUN
+            RunCmd("ip", $"route add {assignedIp}/32 dev {tunName}");
+            _logger.LogInformation("Route added: {Ip} → {Tun}", assignedIp, tunName);
 
             // 5. Запускаем туннель
             var sessionId = (uint)Random.Shared.Next();
@@ -254,6 +271,18 @@ public sealed class VpnServer
         {
             _logger.LogError("Tunnel error for {Name}: {Msg}", tunName, ex.Message);
         }
+    }
+    
+    private static void RunCmd(string cmd, string args)
+    {
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        {
+            FileName               = cmd,
+            Arguments              = args,
+            RedirectStandardOutput = true,
+            RedirectStandardError  = true,
+            UseShellExecute        = false
+        })?.WaitForExit();
     }
 
     /// <summary>
@@ -295,7 +324,10 @@ public sealed class VpnServer
                 await to.WriteAsync(buf.AsMemory(0, read), ct);
             }
         }
-        catch { }
+        catch
+        {
+            // ignored
+        }
     }
 
     /// <summary>Вычисляет публичный ключ X25519 из приватного.</summary>
