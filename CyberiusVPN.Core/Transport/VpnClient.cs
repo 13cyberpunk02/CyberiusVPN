@@ -256,12 +256,6 @@ public sealed class VpnClient
     /// </summary>
     private static void SetupRoutes(string serverHost, string assignedIp)
     {
-        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
-
-        var gw = GetDefaultGateway();
-        if (string.IsNullOrEmpty(gw)) return;
-        Console.WriteLine($"Default gateway: {gw}");
-
         // Резолвим hostname в IP
         var serverIp = serverHost;
         try
@@ -269,29 +263,40 @@ public sealed class VpnClient
             var addresses = System.Net.Dns.GetHostAddresses(serverHost);
             if (addresses.Length > 0) serverIp = addresses[0].ToString();
         }
-        catch
+        catch { }
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            // ignored
+            var gw = GetDefaultGateway();
+            if (string.IsNullOrEmpty(gw)) return;
+            Console.WriteLine($"Default gateway: {gw}, server: {serverIp}");
+
+            var ifIndex = GetInterfaceIndex("vpn0");
+            Console.WriteLine($"vpn0 interface index: {ifIndex}");
+
+            Run("route", $"delete {serverIp} mask 255.255.255.255");
+            Run("route", $"add {serverIp} mask 255.255.255.255 {gw} metric 1");
+            Run("route", "delete 0.0.0.0 mask 0.0.0.0 172.18.0.2");
+            Run("route", "delete 0.0.0.0 mask 128.0.0.0");
+            Run("route", "delete 128.0.0.0 mask 128.0.0.0");
+            Run("route", $"add 0.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
+            Run("route", $"add 128.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
+            Run("netsh", "interface ip set dns \"vpn0\" static 8.8.8.8");
         }
+        else // Linux
+        {
+            var defaultRoute = RunAndRead("ip", "route show default");
+            var parts = defaultRoute.Split(' ');
+            var gw    = parts.Length > 2 ? parts[2] : "";
+            var iface = parts.Length > 4 ? parts[4] : "";
 
-        // Получаем индекс интерфейса vpn0
-        var ifIndex = GetInterfaceIndex("vpn0");
-        Console.WriteLine($"vpn0 interface index: {ifIndex}");
+            Console.WriteLine($"Gateway: {gw} via {iface}, server: {serverIp}");
 
-        // Маршрут к серверу напрямую
-        Run("route", $"delete {serverIp} mask 255.255.255.255");
-        Run("route", $"add {serverIp} mask 255.255.255.255 {gw} metric 1");
-
-        // Удаляем Docker маршрут с метрикой 0 если есть
-        Run("route", "delete 0.0.0.0 mask 0.0.0.0 172.18.0.2");
-
-        // Весь трафик через VPN с указанием интерфейса
-        Run("route", "delete 0.0.0.0 mask 128.0.0.0");
-        Run("route", "delete 128.0.0.0 mask 128.0.0.0");
-        Run("route", $"add 0.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
-        Run("route", $"add 128.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
-
-        Run("netsh", "interface ip set dns \"vpn0\" static 8.8.8.8");
+            Run("ip", $"route add {serverIp}/32 via {gw} dev {iface}");
+            Run("ip", "route del default");
+            Run("ip", "route add default dev vpn0");
+            Run("bash", "-c \"echo 'nameserver 8.8.8.8' > /etc/resolv.conf\"");
+        }
     }
     
     
@@ -319,19 +324,29 @@ public sealed class VpnClient
     /// <summary>Удаляет добавленные маршруты при отключении.</summary>
     private static void CleanupRoutes(string serverHost)
     {
+        var serverIp = serverHost;
+        try
+        {
+            var addresses = System.Net.Dns.GetHostAddresses(serverHost);
+            if (addresses.Length > 0) serverIp = addresses[0].ToString();
+        }
+        catch
+        {
+            // ignored
+        }
+
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            Run("route", $"delete {serverHost} mask 255.255.255.255");
+            Run("route", $"delete {serverIp} mask 255.255.255.255");
             Run("route", "delete 0.0.0.0 mask 128.0.0.0");
             Run("route", "delete 128.0.0.0 mask 128.0.0.0");
             Console.WriteLine("Routes restored.");
         }
-        else
+        else // Linux
         {
-            // Восстанавливаем дефолтный маршрут
-            Run("ip", $"route del {serverHost}/32");
-            Run("ip", "route del default dev vpn0");
-            Run("ip", "route add default via $(ip route | grep ens18 | grep -v default | awk '{print $1}' | head -1)");
+            Run("ip", $"route del {serverIp}/32 2>/dev/null || true");
+            Run("ip", "route del default dev vpn0 2>/dev/null || true");
+            Run("systemctl", "restart NetworkManager");
             Console.WriteLine("Routes restored.");
         }
     }
