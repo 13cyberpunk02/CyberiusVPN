@@ -116,20 +116,27 @@ public sealed class VpnServer
     {
         try
         {
-            if (hello.Length < 76)            return (false, null);
-            if (hello[0] != 0x16)             return (false, null); // TLS record
-            if (hello[5] != 0x01)             return (false, null); // ClientHello
+            if (hello.Length < 76)  return (false, null);
+            if (hello[0] != 0x16)   return (false, null); // TLS record
+            if (hello[5] != 0x01)   return (false, null); // ClientHello
 
             int sessionIdLen = hello[43];
-            if (sessionIdLen != 32)           return (false, null);
+            if (sessionIdLen != 32) return (false, null);
 
-            // Извлекаем эфемерный публичный ключ клиента из key_share extension
+            // Извлекаем auth-токен из session_id
+            var authToken = hello[44..76];
+
+            // Извлекаем эфемерный публичный ключ клиента из key_share
             var clientPubKey = ExtractClientPublicKey(hello);
-            if (clientPubKey is null)         return (false, null);
+            if (clientPubKey is null) return (false, null);
 
-            // Временно: принимаем всех у кого session_id = 32 байта
-            // TODO: реализовать полную проверку через VerifyAuthToken
-            return (true, clientPubKey);
+            // Полная проверка: вычисляем ожидаемый токен через ECDH
+            // ECDH(serverPriv, clientEphPub) + HKDF + timestamp → токен
+            // Проверяем в окне ±30 секунд
+            if (Protocol.RealityHandshake.VerifyAuthToken(authToken, _serverPrivateKey, clientPubKey))
+                return (true, clientPubKey);
+            _logger.LogDebug("Auth token verification failed — forwarding to SNI");
+            return (false, null);
         }
         catch
         {
