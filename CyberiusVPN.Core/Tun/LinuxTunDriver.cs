@@ -48,7 +48,7 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
 
         // SafeFileHandle из fd
         var handle  = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream     = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 0, isAsync: true);
+        _stream     = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
 
         // Настраиваем IP адрес через ip команду
         ConfigureInterface(name, address, mask, mtu);
@@ -85,15 +85,24 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         p.WaitForExit();
     }
 
-    public async Task<byte[]> ReadPacketAsync(CancellationToken ct)
+    public Task<byte[]> ReadPacketAsync(CancellationToken ct)
     {
-        var buf  = new byte[65535];
-        int read = await _stream!.ReadAsync(buf, ct);
-        return buf[..read];
+        return Task.Run(() =>
+        {
+            var buf  = new byte[65535];
+            int read = _stream!.Read(buf, 0, buf.Length);
+            return buf[..read];
+        }, ct);
     }
 
     public Task WritePacketAsync(byte[] packet, CancellationToken ct)
-        => _stream!.WriteAsync(packet, ct).AsTask();
+    {
+        return Task.Run(() =>
+        {
+            _stream!.Write(packet, 0, packet.Length);
+            _stream.Flush();
+        }, ct);
+    }
 
     public async ValueTask DisposeAsync()
     {
