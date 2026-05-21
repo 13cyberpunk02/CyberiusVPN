@@ -246,30 +246,30 @@ public sealed class VpnServer
 
         // 3. Уникальный IP для этого клиента через атомарный счётчик
         _logger.LogInformation("Assigning TUN {Name} ({Ip})", tunName, assignedIp);
-
+        var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
         try
         {
             // 4. Открываем TUN интерфейс для этого клиента
-            var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
-            await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
-            
-            await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
 
+            await tun.OpenAsync(tunName, _config.TunAddress, "255.255.255.0");
             // Маршрут к клиенту через этот TUN
             RunCmd("ip", $"route add {assignedIp}/32 dev {tunName}");
             _logger.LogInformation("Route added: {Ip} → {Tun}", assignedIp, tunName);
 
             // 5. Запускаем туннель
             var sessionId = (uint)Random.Shared.Next();
-            var framer    = new VpnFramer(serverKeys, sessionId, _logger);
-            var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
+            var framer = new VpnFramer(serverKeys, sessionId, _logger);
+            var tunnel = new VpnTunnel(framer, tun, stream, _logger);
 
             await tunnel.RunAsync(ct);
-            await tun.DisposeAsync();
         }
         catch (Exception ex)
         {
             _logger.LogError("Tunnel error for {Name}: {Msg}", tunName, ex.Message);
+        }
+        finally
+        {
+            await tun.DisposeAsync();
         }
     }
     

@@ -109,7 +109,7 @@ public sealed class VpnClient
             await tun.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
 
             // 7. Прописываем маршрут к серверу через реальный шлюз
-            SetupRoutes(_config.ServerHost);
+            SetupRoutes(_config.ServerHost, assignedIp);
 
             // 8. Запускаем туннель
             var sessionId = (uint)Random.Shared.Next();
@@ -254,42 +254,67 @@ public sealed class VpnClient
     /// Прописывает маршрут к VPN серверу через реальный шлюз.
     /// Без этого трафик к серверу пойдёт через TUN и создаст петлю.
     /// </summary>
-   private static void SetupRoutes(string serverHost)
-   {
-       if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-       {
-           var gw = GetDefaultGateway();
-           if (string.IsNullOrEmpty(gw)) return;
-           Console.WriteLine($"Default gateway: {gw}");
-           Run("route", $"delete {serverHost} mask 255.255.255.255");
-           Run("route", $"add {serverHost} mask 255.255.255.255 {gw} metric 1");
-           Run("route", "delete 0.0.0.0 mask 128.0.0.0");
-           Run("route", "delete 128.0.0.0 mask 128.0.0.0");
-           Run("route", "add 0.0.0.0 mask 128.0.0.0 10.8.0.1 metric 5");
-           Run("route", "add 128.0.0.0 mask 128.0.0.0 10.8.0.1 metric 5");
-       }
-       else
-       {
-           // Узнаём реальный шлюз и интерфейс
-           var gwLine = RunAndRead("ip", "route show default");
-           // Формат: "default via 10.0.0.1 dev ens18 ..."
-           var parts = gwLine.Split(' ');
-           var gw    = parts.Length > 2 ? parts[2] : "";
-           var iface = parts.Length > 4 ? parts[4] : "";
-   
-           Console.WriteLine($"Default gateway: {gw} via {iface}");
-   
-           // Маршрут к VPN серверу напрямую — чтобы не было петли
-           Run("ip", $"route add {serverHost}/32 via {gw} dev {iface}");
-   
-           // Весь остальной трафик через TUN
-           Run("ip", "route del default");
-           Run("ip", "route add default dev vpn0");
-   
-           // DNS через Google (иначе имена не резолвятся)
-           Run("resolvectl", "dns vpn0 8.8.8.8 8.8.4.4");
-       }
-   }
+    private static void SetupRoutes(string serverHost, string assignedIp)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+
+        var gw = GetDefaultGateway();
+        if (string.IsNullOrEmpty(gw)) return;
+        Console.WriteLine($"Default gateway: {gw}");
+
+        // Резолвим hostname в IP
+        var serverIp = serverHost;
+        try
+        {
+            var addresses = System.Net.Dns.GetHostAddresses(serverHost);
+            if (addresses.Length > 0) serverIp = addresses[0].ToString();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        // Получаем индекс интерфейса vpn0
+        var ifIndex = GetInterfaceIndex("vpn0");
+        Console.WriteLine($"vpn0 interface index: {ifIndex}");
+
+        // Маршрут к серверу напрямую
+        Run("route", $"delete {serverIp} mask 255.255.255.255");
+        Run("route", $"add {serverIp} mask 255.255.255.255 {gw} metric 1");
+
+        // Удаляем Docker маршрут с метрикой 0 если есть
+        Run("route", "delete 0.0.0.0 mask 0.0.0.0 172.18.0.2");
+
+        // Весь трафик через VPN с указанием интерфейса
+        Run("route", "delete 0.0.0.0 mask 128.0.0.0");
+        Run("route", "delete 128.0.0.0 mask 128.0.0.0");
+        Run("route", $"add 0.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
+        Run("route", $"add 128.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
+
+        Run("netsh", "interface ip set dns \"vpn0\" static 8.8.8.8");
+    }
+    
+    
+    private static int GetInterfaceIndex(string interfaceName)
+    {
+        try
+        {
+            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.Name.Equals(interfaceName, StringComparison.OrdinalIgnoreCase))
+                {
+                    var props = ni.GetIPProperties();
+                    return props.GetIPv4Properties().Index;
+                }
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+
+        return 0;
+    }
 
     /// <summary>Удаляет добавленные маршруты при отключении.</summary>
     private static void CleanupRoutes(string serverHost)
