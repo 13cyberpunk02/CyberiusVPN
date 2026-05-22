@@ -60,7 +60,7 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         _name = name;
         var fd = open("/dev/net/tun", O_RDWR);
         if (fd < 0)
-            throw new IOException($"Cannot open /dev/net/tun (run as root?), errno={Marshal.GetLastWin32Error()}");
+            throw new IOException($"Cannot open /dev/net/tun, errno={Marshal.GetLastWin32Error()}");
 
         var ifr = new IfReq
         {
@@ -72,13 +72,13 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         if (ioctl(fd, TUNSETIFF, ref ifr) < 0)
             throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
 
+        // bufferSize: 1 отключает внутренний буфер FileStream
+        // TUN устройство нельзя читать через буферизованный поток
         var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
+        _stream = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
 
         ConfigureInterface(name, address, mask, mtu);
 
-        // Запускаем один постоянный поток для чтения TUN
-        // Это лучше чем Task.Run на каждый пакет
         _readerThread = new Thread(ReaderLoop)
         {
             IsBackground = true,
@@ -100,14 +100,12 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         {
             try
             {
-                int read = _stream!.Read(_readBuffer, 0, _readBuffer.Length);
+                // Читаем напрямую через Span без внутреннего буфера
+                int read = _stream!.Read(_readBuffer.AsSpan());
                 if (read <= 0) continue;
 
-                // Копируем только реальные данные в новый буфер
                 var packet = new byte[read];
                 Buffer.BlockCopy(_readBuffer, 0, packet, 0, read);
-
-                // Неблокирующая запись в channel
                 _readChannel.Writer.TryWrite(packet);
             }
             catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
