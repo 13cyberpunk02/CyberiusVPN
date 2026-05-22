@@ -13,10 +13,10 @@ namespace CyberiusVPN.Core.Transport;
 /// </summary>
 public sealed class VpnTunnel
 {
-    private readonly ILogger          _logger;
-    private readonly VpnFramer        _framer;
+    private readonly ILogger _logger;
+    private readonly VpnFramer _framer;
     private readonly Tun.TunInterface _tun;
-    private readonly Stream           _transport;
+    private readonly Stream _transport;
 
     /// <summary>
     /// Создаёт туннель.
@@ -27,10 +27,10 @@ public sealed class VpnTunnel
     /// <param name="logger">Логгер.</param>
     public VpnTunnel(VpnFramer framer, Tun.TunInterface tun, Stream transport, ILogger logger)
     {
-        _framer    = framer;
-        _tun       = tun;
+        _framer = framer;
+        _tun = tun;
         _transport = transport;
-        _logger    = logger;
+        _logger = logger;
     }
 
     /// <summary>
@@ -95,20 +95,40 @@ public sealed class VpnTunnel
     /// <summary>Сервер → расшифровываем → TUN.</summary>
     private async Task PumpInboundAsync(CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested)
+        // Channel между получателем TCP и записью в TUN
+        var channel = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            new System.Threading.Channels.BoundedChannelOptions(64)
+            {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+            });
+
+        // Получатель — читает и расшифровывает из TCP
+        var receiver = Task.Run(async () =>
         {
-            var result = await _framer.ReceivePacketAsync(_transport, ct);
-            if (result is null) break;
+            while (!ct.IsCancellationRequested)
+            {
+                var result = await _framer.ReceivePacketAsync(_transport, ct);
+                if (result is null) break;
 
-            var (type, payload) = result.Value;
+                var (type, payload) = result.Value;
+                if (type == PacketType.Data && payload.Length > 0)
+                    await channel.Writer.WriteAsync(payload, ct);
+            }
 
-            if (type == PacketType.Data)
+            channel.Writer.TryComplete();
+        }, ct);
+
+        // Писатель — пишет в TUN
+        var writer = Task.Run(async () =>
+        {
+            await foreach (var payload in channel.Reader.ReadAllAsync(ct))
             {
                 await _tun.WritePacketAsync(payload, ct);
                 _logger.LogTrace("← {Bytes} bytes", payload.Length);
             }
-            // Keepalive — принимаем без действий
-        }
+        }, ct);
+
+        await Task.WhenAll(receiver, writer);
     }
 
     /// <summary>Keepalive каждые 25 секунд чтобы NAT не закрыл соединение.</summary>
