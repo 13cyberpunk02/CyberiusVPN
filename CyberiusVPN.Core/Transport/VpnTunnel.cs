@@ -62,14 +62,34 @@ public sealed class VpnTunnel
     /// <summary>TUN → шифруем → сервер.</summary>
     private async Task PumpOutboundAsync(CancellationToken ct)
     {
-        while (!ct.IsCancellationRequested)
-        {
-            var packet = await _tun.ReadPacketAsync(ct);
-            if (packet.Length == 0) continue;
+        // Канал между читателем TUN и отправителем
+        var channel = System.Threading.Channels.Channel.CreateBounded<byte[]>(
+            new System.Threading.Channels.BoundedChannelOptions(32)
+            {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+            });
 
-            await _framer.SendPacketAsync(_transport, packet, PacketType.Data, ct);
-            _logger.LogTrace("→ {Bytes} bytes", packet.Length);
-        }
+        // Читатель TUN — просто читает пакеты
+        var reader = Task.Run(async () =>
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                var packet = await _tun.ReadPacketAsync(ct);
+                if (packet.Length > 0)
+                    await channel.Writer.WriteAsync(packet, ct);
+            }
+        }, ct);
+
+        // Отправитель — шифрует и отправляет
+        var sender = Task.Run(async () =>
+        {
+            await foreach (var packet in channel.Reader.ReadAllAsync(ct))
+            {
+                await _framer.SendPacketAsync(_transport, packet, PacketType.Data, ct);
+            }
+        }, ct);
+
+        await Task.WhenAll(reader, sender);
     }
 
     /// <summary>Сервер → расшифровываем → TUN.</summary>

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Security.Cryptography;
 
 namespace CyberiusVPN.Core.Crypto;
@@ -12,7 +13,8 @@ public sealed class PacketCipher : IDisposable
 {
     private readonly AesGcm _cipher;
     private readonly byte[] _baseIv;
-    private ulong           _counter;
+    private readonly byte[] _nonceBuf = new byte[12]; // переиспользуем буфер nonce
+    private ulong _counter;
 
     /// <summary>
     /// Создаёт шифр с указанным ключом и базовым IV.
@@ -21,8 +23,8 @@ public sealed class PacketCipher : IDisposable
     /// <param name="iv">Базовый IV (12 байт), XOR-ится с счётчиком пакетов.</param>
     public PacketCipher(byte[] key, byte[] iv)
     {
-        _cipher  = new AesGcm(key, AesGcm.TagByteSizes.MaxSize);
-        _baseIv  = iv;
+        _cipher = new AesGcm(key, AesGcm.TagByteSizes.MaxSize);
+        _baseIv = iv;
         _counter = 0;
     }
 
@@ -34,16 +36,26 @@ public sealed class PacketCipher : IDisposable
     /// <returns>Зашифрованный пакет с 16-байтным GCM тегом в конце.</returns>
     public byte[] Encrypt(byte[] plaintext, byte[] aad)
     {
-        var nonce      = BuildNonce(_counter++);
-        var ciphertext = new byte[plaintext.Length];
-        var tag        = new byte[16];
+        BuildNonce(_counter++);
 
-        _cipher.Encrypt(nonce, plaintext, ciphertext, tag, aad);
+        var ciphertext = ArrayPool<byte>.Shared.Rent(plaintext.Length);
+        var tag = ArrayPool<byte>.Shared.Rent(16);
 
-        var result = new byte[ciphertext.Length + 16];
-        ciphertext.CopyTo(result, 0);
-        tag.CopyTo(result, ciphertext.Length);
-        return result;
+        try
+        {
+            _cipher.Encrypt(_nonceBuf, plaintext, ciphertext.AsSpan(0, plaintext.Length),
+                tag.AsSpan(0, 16), aad);
+
+            var result = new byte[plaintext.Length + 16];
+            ciphertext.AsSpan(0, plaintext.Length).CopyTo(result);
+            tag.AsSpan(0, 16).CopyTo(result.AsSpan(plaintext.Length));
+            return result;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(ciphertext);
+            ArrayPool<byte>.Shared.Return(tag);
+        }
     }
 
     /// <summary>
@@ -56,29 +68,35 @@ public sealed class PacketCipher : IDisposable
     /// <exception cref="CryptographicException">Если тег не совпал (пакет повреждён или подменён).</exception>
     public byte[] Decrypt(byte[] ciphertextWithTag, byte[] aad, ulong nonce)
     {
-        var nonceBytes = BuildNonce(nonce);
-        var ciphertext = ciphertextWithTag[..^16];
-        var tag        = ciphertextWithTag[^16..];
-        var plaintext  = new byte[ciphertext.Length];
+        BuildNonce(nonce);
 
-        _cipher.Decrypt(nonceBytes, ciphertext, tag, plaintext, aad);
+        var ciphertextLen = ciphertextWithTag.Length - 16;
+        var plaintext = new byte[ciphertextLen];
+
+        // Span без копирования — указываем на существующий массив
+        _cipher.Decrypt(_nonceBuf,
+            ciphertextWithTag.AsSpan(0, ciphertextLen),
+            ciphertextWithTag.AsSpan(ciphertextLen, 16),
+            plaintext, aad);
         return plaintext;
     }
 
     /// <summary>
-    /// Строит уникальный nonce: baseIV XOR counter (как в TLS 1.3 RFC 8446).
+    /// Строит nonce прямо в _nonceBuf без аллокации.
+    /// baseIV XOR counter — как в TLS 1.3.
     /// </summary>
-    private byte[] BuildNonce(ulong counter)
+    private void BuildNonce(ulong counter)
     {
-        var nonce        = (byte[])_baseIv.Clone();
+        // Копируем baseIv в буфер
+        _baseIv.AsSpan().CopyTo(_nonceBuf);
+
+        // XOR с counter
         var counterBytes = BitConverter.GetBytes(counter);
         if (!BitConverter.IsLittleEndian)
             Array.Reverse(counterBytes);
 
-        for (int i = 0; i < 8; i++)
-            nonce[4 + i] ^= counterBytes[i];
-
-        return nonce;
+        for (var i = 0; i < 8; i++)
+            _nonceBuf[4 + i] ^= counterBytes[i];
     }
 
     /// <inheritdoc/>

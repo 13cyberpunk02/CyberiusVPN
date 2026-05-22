@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Text.RegularExpressions;
 using CyberiusVPN.Core.Crypto;
 using CyberiusVPN.Core.Models;
 using CyberiusVPN.Core.Tun;
@@ -12,12 +13,12 @@ namespace CyberiusVPN.Core.Transport;
 /// VPN Сервер с Reality-подобным роутингом.
 ///
 /// Алгоритм обработки входящего соединения:
-/// 1. Читаем TCP поток (первые 512 байт — TLS ClientHello)
+/// 1. Читаем TCP поток (первые 512 байт - TLS ClientHello)
 /// 2. Парсим session_id (32 байта по offset 44)
 /// 3. Извлекаем эфемерный публичный ключ клиента из key_share extension
 /// 4. Проверяем auth-токен через ECDH + HKDF
-///    — наш клиент → VPN сессия
-///    — чужой       → форвардим к реальному SNI домену (маскировка)
+///    - наш клиент → VPN сессия
+///    - чужой → перенаправление к реальному SNI домену (маскировка)
 /// </summary>
 public sealed class VpnServer
 {
@@ -25,7 +26,6 @@ public sealed class VpnServer
     private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly byte[] _serverPrivateKey;
-    private readonly byte[] _serverPublicKey;
 
     /// <summary>Атомарный счётчик для назначения уникальных IP клиентам.</summary>
     private int _nextClientIp = 2;
@@ -41,7 +41,6 @@ public sealed class VpnServer
         _loggerFactory = loggerFactory;
         _logger = loggerFactory.CreateLogger<VpnServer>();
         _serverPrivateKey = KeyExchange.FromBase64(config.PrivateKey);
-        _serverPublicKey = X25519PublicFromPrivate(_serverPrivateKey);
     }
 
     /// <summary>
@@ -74,7 +73,7 @@ public sealed class VpnServer
             var result = RunAndRead("ip", "link show");
             foreach (var line in result.Split('\n'))
             {
-                var match = System.Text.RegularExpressions.Regex.Match(line, @"\d+:\s+(vpns\d+):");
+                var match = Regex.Match(line, @"\d+:\s+(vpns\d+):");
                 if (!match.Success) continue;
                 var name = match.Groups[1].Value;
                 RunCmd("ip", $"link del {name}");
@@ -108,7 +107,7 @@ public sealed class VpnServer
 
         try
         {
-            using var stream = tcp.GetStream();
+            await using var stream = tcp.GetStream();
 
             // Читаем ClientHello без продвижения позиции (peek)
             var hello = await PeekClientHelloAsync(stream, ct);
@@ -188,11 +187,11 @@ public sealed class VpnServer
         try
         {
             // Пропускаем session_id
-            int pos = 44 + hello[43];
+            var pos = 44 + hello[43];
 
             // cipher_suites length
             if (pos + 2 > hello.Length) return null;
-            int cipherLen = (hello[pos] << 8) | hello[pos + 1];
+            var cipherLen = (hello[pos] << 8) | hello[pos + 1];
             pos += 2 + cipherLen;
 
             // compression_methods length
@@ -201,29 +200,29 @@ public sealed class VpnServer
             pos += 1 + compLen;
 
             // extensions total length
-            if (pos + 2 > hello.Length) return null;
-            int extsLen = (hello[pos] << 8) | hello[pos + 1];
+            if (pos + 2 > hello.Length) return null; 
+            var extsLen = (hello[pos] << 8) | hello[pos + 1];
             pos += 2;
-            int extsEnd = pos + extsLen;
+            var extsEnd = pos + extsLen;
 
             // Итерируем extensions
             while (pos + 4 <= extsEnd && pos + 4 <= hello.Length)
             {
-                int extType = (hello[pos] << 8) | hello[pos + 1];
-                int extLen = (hello[pos + 2] << 8) | hello[pos + 3];
+                var extType = (hello[pos] << 8) | hello[pos + 1];
+                var extLen = (hello[pos + 2] << 8) | hello[pos + 3];
                 pos += 4;
 
                 if (extType == 0x0033) // key_share
                 {
-                    int ksPos = pos;
-                    int ksLen = (hello[ksPos] << 8) | hello[ksPos + 1];
+                    var ksPos = pos;
+                    var ksLen = (hello[ksPos] << 8) | hello[ksPos + 1];
                     ksPos += 2;
-                    int ksEnd = ksPos + ksLen;
+                    var ksEnd = ksPos + ksLen;
 
                     while (ksPos + 4 <= ksEnd && ksPos + 4 <= hello.Length)
                     {
-                        int group = (hello[ksPos] << 8) | hello[ksPos + 1];
-                        int keyLen = (hello[ksPos + 2] << 8) | hello[ksPos + 3];
+                        var group = (hello[ksPos] << 8) | hello[ksPos + 1];
+                        var keyLen = (hello[ksPos + 2] << 8) | hello[ksPos + 3];
                         ksPos += 4;
 
                         if (group == 0x001D && keyLen == 32) // x25519
@@ -330,7 +329,7 @@ public sealed class VpnServer
     }
 
     /// <summary>
-    /// Форвардим соединение к реальному HTTPS серверу.
+    /// Перенаправляем соединение к реальному HTTPS серверу.
     /// DPI видит: клиент → легитимный сертификат → обычный HTTPS.
     /// </summary>
     private async Task ForwardToRealServerAsync(NetworkStream clientStream, byte[] buffered, CancellationToken ct)
@@ -339,7 +338,7 @@ public sealed class VpnServer
         {
             using var real = new TcpClient();
             await real.ConnectAsync(_config.SniDomain, 443, ct);
-            using var realStream = real.GetStream();
+            await using var realStream = real.GetStream();
 
             // Отправляем буферизованный ClientHello реальному серверу
             await realStream.WriteAsync(buffered, ct);
@@ -363,7 +362,7 @@ public sealed class VpnServer
         {
             while (!ct.IsCancellationRequested)
             {
-                int read = await from.ReadAsync(buf, ct);
+                var read = await from.ReadAsync(buf, ct);
                 if (read == 0) break;
                 await to.WriteAsync(buf.AsMemory(0, read), ct);
             }
@@ -372,15 +371,5 @@ public sealed class VpnServer
         {
             // ignored
         }
-    }
-
-    /// <summary>Вычисляет публичный ключ X25519 из приватного.</summary>
-    private static byte[] X25519PublicFromPrivate(byte[] privateKey)
-    {
-        var priv = new Org.BouncyCastle.Crypto.Parameters.X25519PrivateKeyParameters(privateKey, 0);
-        var pub = priv.GeneratePublicKey();
-        var bytes = new byte[32];
-        pub.Encode(bytes, 0);
-        return bytes;
     }
 }

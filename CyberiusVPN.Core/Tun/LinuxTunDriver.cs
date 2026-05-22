@@ -1,5 +1,8 @@
+using System.Diagnostics;
 using System.Net;
+using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
 namespace CyberiusVPN.Core.Tun;
@@ -10,10 +13,9 @@ namespace CyberiusVPN.Core.Tun;
 /// FileStream открывается в синхронном режиме (TUN fd не поддерживает overlapped I/O),
 /// чтение/запись выполняются в Task.Run для не-блокирующей async работы.
 /// </summary>
-internal sealed class LinuxTunDriver : ITunDriver
+internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
 {
-    private readonly ILogger _logger;
-    private FileStream?      _stream;
+    private FileStream? _stream;
     private string _name = "";
 
     [DllImport("libc", SetLastError = true)]
@@ -22,49 +24,115 @@ internal sealed class LinuxTunDriver : ITunDriver
     [DllImport("libc", SetLastError = true)]
     private static extern int open([MarshalAs(UnmanagedType.LPStr)] string path, int flags);
 
-    private const uint  TUNSETIFF  = 0x400454CA;
-    private const short IFF_TUN    = 0x0001;
-    private const short IFF_NO_PI  = 0x1000;
-    private const int   O_RDWR     = 2;
+    private const uint TUNSETIFF = 0x400454CA;
+    private const short IFF_TUN = 0x0001;
+    private const short IFF_NO_PI = 0x1000;
+    private const int O_RDWR = 2;
+
+    // Постоянный буфер чтения — не аллоцируем на каждый пакет
+    private readonly byte[] _readBuffer = new byte[65535];
+
+    // Channel для передачи пакетов из фонового потока в async pipeline
+    private readonly Channel<byte[]> _readChannel =
+        Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(256)
+            {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
+            });
+
+    private Thread? _readerThread;
+    private CancellationTokenSource _cts = new();
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     private struct IfReq
     {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
         public string Name;
-        public short  Flags;
+
+        public short Flags;
+
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 22)]
         public byte[] Padding;
     }
 
-    public LinuxTunDriver(ILogger logger) => _logger = logger;
-
     public Task OpenAsync(string name, string address, string mask, int mtu)
     {
         _name = name;
-        int fd = open("/dev/net/tun", O_RDWR);
+        var fd = open("/dev/net/tun", O_RDWR);
         if (fd < 0)
             throw new IOException($"Cannot open /dev/net/tun (run as root?), errno={Marshal.GetLastWin32Error()}");
 
         var ifr = new IfReq
         {
-            Name    = name,
-            Flags   = IFF_TUN | IFF_NO_PI,
+            Name = name,
+            Flags = IFF_TUN | IFF_NO_PI,
             Padding = new byte[22]
         };
 
         if (ioctl(fd, TUNSETIFF, ref ifr) < 0)
             throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
 
-        // Синхронный режим FileStream — TUN fd не поддерживает overlapped I/O
         var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream    = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
+        _stream = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 4096, isAsync: false);
 
         ConfigureInterface(name, address, mask, mtu);
 
-        _logger.LogInformation("Linux TUN {Name} configured", name);
+        // Запускаем один постоянный поток для чтения TUN
+        // Это лучше чем Task.Run на каждый пакет
+        _readerThread = new Thread(ReaderLoop)
+        {
+            IsBackground = true,
+            Name = $"TUN-Reader-{name}"
+        };
+        _readerThread.Start();
+
+        logger.LogInformation("Linux TUN {Name} configured", name);
         return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Постоянный цикл чтения в отдельном потоке.
+    /// Блокирующий Read не мешает async pipeline — он в своём потоке.
+    /// </summary>
+    private void ReaderLoop()
+    {
+        while (!_cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                int read = _stream!.Read(_readBuffer, 0, _readBuffer.Length);
+                if (read <= 0) continue;
+
+                // Копируем только реальные данные в новый буфер
+                var packet = new byte[read];
+                Buffer.BlockCopy(_readBuffer, 0, packet, 0, read);
+
+                // Неблокирующая запись в channel
+                _readChannel.Writer.TryWrite(packet);
+            }
+            catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
+            {
+                logger.LogWarning("TUN read error: {Msg}", ex.Message);
+                break;
+            }
+        }
+
+        _readChannel.Writer.TryComplete();
+    }
+
+    /// <summary>
+    /// Async чтение из channel — не блокирует thread pool.
+    /// </summary>
+    public async Task<byte[]> ReadPacketAsync(CancellationToken ct)
+    {
+        return await _readChannel.Reader.ReadAsync(ct);
+    }
+
+    public Task WritePacketAsync(byte[] packet, CancellationToken ct) => Task.Run(() =>
+    {
+        _stream!.Write(packet, 0, packet.Length);
+        // Убираем Flush — TUN не буферизует, Flush лишний syscall
+    }, ct);
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
     {
@@ -76,40 +144,27 @@ internal sealed class LinuxTunDriver : ITunDriver
     private static int MaskToCidr(string mask)
     {
         var bytes = IPAddress.Parse(mask).GetAddressBytes();
-        int bits  = 0;
+        var bits = 0;
         foreach (var b in bytes)
-            bits += System.Numerics.BitOperations.PopCount(b);
+            bits += BitOperations.PopCount(b);
         return bits;
     }
 
     private static void Run(string cmd, string args)
     {
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+        Process.Start(new ProcessStartInfo
         {
-            FileName               = cmd,
-            Arguments              = args,
+            FileName = cmd,
+            Arguments = args,
             RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            UseShellExecute        = false
+            RedirectStandardError = true,
+            UseShellExecute = false
         })?.WaitForExit();
     }
 
-    // Синхронное чтение в Task.Run — не блокирует thread pool
-    public Task<byte[]> ReadPacketAsync(CancellationToken ct) => Task.Run(() =>
-    {
-        var buf  = new byte[65535];
-        int read = _stream!.Read(buf, 0, buf.Length);
-        return buf[..read];
-    }, ct);
-
-    public Task WritePacketAsync(byte[] packet, CancellationToken ct) => Task.Run(() =>
-    {
-        _stream!.Write(packet, 0, packet.Length);
-        _stream.Flush();
-    }, ct);
-
     public async ValueTask DisposeAsync()
     {
+        await _cts.CancelAsync();
         if (_stream != null) await _stream.DisposeAsync();
         if (!string.IsNullOrEmpty(_name))
             Run("ip", $"link del {_name}");
