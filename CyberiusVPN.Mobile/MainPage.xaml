@@ -1,0 +1,90 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             x:Class="CyberiusVPN.Mobile.MainPage"
+             BackgroundColor="#1A1A2E">
+
+    <ScrollView>
+        <VerticalStackLayout Padding="24" Spacing="20">
+
+            <!-- Логотип / статус -->
+            <Border BackgroundColor="#16213E"
+                    StrokeThickness="2" Stroke="#0F3460"
+                    HorizontalOptions="Center"
+                    HeightRequest="160" WidthRequest="160">
+                <Border.StrokeShape>
+                    <RoundRectangle CornerRadius="80"/>
+                </Border.StrokeShape>
+                <Label x:Name="StatusIcon" Text="🔒"
+                       FontSize="64"
+                       HorizontalOptions="Center"
+                       VerticalOptions="Center"/>
+            </Border>
+
+            <!-- Статус подключения -->
+            <Label x:Name="StatusLabel" Text="Отключено"
+                   FontSize="22" FontAttributes="Bold"
+                   TextColor="#E94560"
+                   HorizontalOptions="Center"/>
+
+            <Label x:Name="IpLabel" Text=""
+                   FontSize="14" TextColor="#888"
+                   HorizontalOptions="Center"/>
+
+            <!-- Настройки сервера -->
+            <Border BackgroundColor="#16213E"
+                    StrokeThickness="1" Stroke="#0F3460"
+                    Padding="16">
+                <Border.StrokeShape>
+                    <RoundRectangle CornerRadius="12"/>
+                </Border.StrokeShape>
+                <VerticalStackLayout Spacing="8">
+
+                    <Label Text="Сервер" TextColor="#888" FontSize="12"/>
+                    <Entry x:Name="ServerEntry"
+                           Text="service.cyberius.site"
+                           TextColor="White"
+                           BackgroundColor="#0F3460"/>
+
+                    <Label Text="Порт" TextColor="#888" FontSize="12"/>
+                    <Entry x:Name="PortEntry" Text="3443"
+                           TextColor="White"
+                           BackgroundColor="#0F3460"
+                           Keyboard="Numeric"/>
+
+                    <Label Text="SNI домен" TextColor="#888" FontSize="12"/>
+                    <Entry x:Name="SniEntry" Text="www.microsoft.com"
+                           TextColor="White"
+                           BackgroundColor="#0F3460"/>
+
+                    <Label Text="Публичный ключ сервера" TextColor="#888" FontSize="12"/>
+                    <Entry x:Name="PubKeyEntry"
+                           TextColor="White"
+                           BackgroundColor="#0F3460"
+                           Placeholder="Base64 публичный ключ"/>
+
+                    <Label Text="Приватный ключ клиента" TextColor="#888" FontSize="12"/>
+                    <Entry x:Name="PrivKeyEntry"
+                           TextColor="White"
+                           BackgroundColor="#0F3460"
+                           IsPassword="True"
+                           Placeholder="Base64 приватный ключ"/>
+
+                </VerticalStackLayout>
+            </Border>
+
+            <!-- Кнопка подключения -->
+            <Button x:Name="ConnectBtn"
+                    Text="Подключить"
+                    BackgroundColor="#E94560"
+                    TextColor="White"
+                    FontSize="18" FontAttributes="Bold"
+                    HeightRequest="56"
+                    Clicked="OnConnectClicked">
+                <Button.CornerRadius>12</Button.CornerRadius>
+            </Button>
+
+        </VerticalStackLayout>
+    </ScrollView>
+
+</ContentPage>

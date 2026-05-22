@@ -1,4 +1,5 @@
 using CyberiusVPN.Core.Models;
+using CyberiusVPN.Core.Tun;
 using Microsoft.Extensions.Logging;
 
 namespace CyberiusVPN.Core.Transport;
@@ -15,7 +16,7 @@ public sealed class VpnTunnel
 {
     private readonly ILogger _logger;
     private readonly VpnFramer _framer;
-    private readonly Tun.TunInterface _tun;
+    private readonly ITunDriver _tun;
     private readonly Stream _transport;
 
     /// <summary>
@@ -25,7 +26,7 @@ public sealed class VpnTunnel
     /// <param name="tun">TUN интерфейс для чтения/записи IP-пакетов.</param>
     /// <param name="transport">TCP поток к удалённой стороне.</param>
     /// <param name="logger">Логгер.</param>
-    public VpnTunnel(VpnFramer framer, Tun.TunInterface tun, Stream transport, ILogger logger)
+    public VpnTunnel(VpnFramer framer, ITunDriver tun, Stream transport, ILogger logger)
     {
         _framer = framer;
         _tun = tun;

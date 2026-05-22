@@ -25,12 +25,13 @@ namespace CyberiusVPN.Core.Transport;
 /// </summary>
 public sealed class VpnClient
 {
-    private readonly VpnConfig      _config;
-    private readonly ILogger        _logger;
+    private readonly VpnConfig _config;
+    private readonly ILogger _logger;
     private readonly ILoggerFactory _loggerFactory;
-    private readonly byte[]         _clientPrivateKey;
-    private readonly byte[]         _serverPublicKey;
+    private readonly byte[] _clientPrivateKey;
+    private readonly byte[] _serverPublicKey;
     private readonly IRouteManager? _routeManager;
+    private readonly ITunDriver? _tunDriver;
 
     /// <summary>
     /// Создаёт VPN клиент.
@@ -38,14 +39,20 @@ public sealed class VpnClient
     /// <param name="config">Конфигурация подключения.</param>
     /// <param name="loggerFactory">Фабрика логгеров.</param>
     /// <param name="routeManager">Менеджер управления маршрутами, смотря на какой платформе запускается</param>
-    public VpnClient(VpnConfig config, ILoggerFactory loggerFactory, IRouteManager? routeManager = null)
+    /// <param name="tunDriver">Передаем драйвер сетевой для управления сетью, и прописывания маршрутов, смотря по платформе</param>
+    public VpnClient(
+        VpnConfig config,
+        ILoggerFactory loggerFactory,
+        IRouteManager? routeManager = null,
+        ITunDriver? tunDriver = null)
     {
-        _config           = config;
-        _loggerFactory    = loggerFactory;
-        _logger           = loggerFactory.CreateLogger<VpnClient>();
+        _config = config;
+        _loggerFactory = loggerFactory;
+        _logger = loggerFactory.CreateLogger<VpnClient>();
         _clientPrivateKey = KeyExchange.FromBase64(config.ClientPrivateKey);
-        _serverPublicKey  = KeyExchange.FromBase64(config.ServerPublicKey);
-        _routeManager     = routeManager;
+        _serverPublicKey = KeyExchange.FromBase64(config.ServerPublicKey);
+        _routeManager = routeManager;
+        _tunDriver = tunDriver;
     }
 
     /// <summary>
@@ -92,7 +99,7 @@ public sealed class VpnClient
         await tcp.ConnectAsync(_config.ServerHost, _config.ServerPort, ct);
         _logger.LogInformation("TCP connected");
 
-        using var stream = tcp.GetStream();
+        await using var stream = tcp.GetStream();
 
         try
         {
@@ -106,34 +113,44 @@ public sealed class VpnClient
             await SendRealityClientHelloAsync(stream, authToken, ephPubKey, ct);
 
             // 4. Получаем соль от сервера
-            var handshake  = new byte[36];
+            var handshake = new byte[36];
             await ReadExactAsync(stream, handshake, ct);
-            var salt       = handshake[..32];
+            var salt = handshake[..32];
             var assignedIp = new System.Net.IPAddress(handshake[32..36]).ToString();
             _logger.LogInformation("Assigned IP: {Ip}", assignedIp);
 
             // 5. ECDH с эфемерным ключом → сессионные ключи
             var sharedSecret = KeyExchange.ComputeSharedSecret(ephPrivKey, _serverPublicKey);
-            var keys         = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
+            var keys = KeyDerivation.DeriveSessionKeys(sharedSecret, salt);
 
             _logger.LogInformation("Session keys derived, opening TUN...");
 
             // 6. Открываем TUN интерфейс
-            var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
-            await tun.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
+            ITunDriver tunDriver;
+            if (_tunDriver is not null)
+            {
+                tunDriver = _tunDriver;
+                await tunDriver.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
+            }
+            else
+            {
+                var tun = new TunInterface(_loggerFactory.CreateLogger<TunInterface>());
+                await tun.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
+                tunDriver = tun;
+            }
 
             // 7. Прописываем маршрут к серверу через реальный шлюз
             _routeManager?.Setup(serverIp, assignedIp, "vpn0");
 
             // 8. Запускаем туннель
             var sessionId = (uint)Random.Shared.Next();
-            var framer    = new VpnFramer(keys, sessionId, _logger);
-            var tunnel    = new VpnTunnel(framer, tun, stream, _logger);
+            var framer = new VpnFramer(keys, sessionId, _logger);
+            var tunnel = new VpnTunnel(framer, tunDriver, stream, _logger);
 
             _logger.LogInformation("VPN connected! Routing traffic through tunnel.");
 
             await tunnel.RunAsync(ct);
-            await tun.DisposeAsync();
+            if (tunDriver is IAsyncDisposable d) await d.DisposeAsync();
         }
         finally
         {
@@ -154,11 +171,11 @@ public sealed class VpnClient
         byte[] ephPubKey, CancellationToken ct)
     {
         using var ms = new System.IO.MemoryStream();
-        using var w  = new System.IO.BinaryWriter(ms);
+        using var w = new System.IO.BinaryWriter(ms);
 
         // === ClientHello body ===
         using var helloMs = new System.IO.MemoryStream();
-        using var hw      = new System.IO.BinaryWriter(helloMs);
+        using var hw = new System.IO.BinaryWriter(helloMs);
 
         // Client version: TLS 1.2 (0x0303) — в TLS 1.3 реальная версия в extension
         hw.Write((byte)0x03);
@@ -193,7 +210,7 @@ public sealed class VpnClient
 
         // === Handshake message ===
         using var hsMs = new System.IO.MemoryStream();
-        using var hsw  = new System.IO.BinaryWriter(hsMs);
+        using var hsw = new System.IO.BinaryWriter(hsMs);
 
         hsw.Write((byte)0x01); // HandshakeType: ClientHello
         hsw.Write((byte)((helloBody.Length >> 16) & 0xFF));
@@ -221,7 +238,7 @@ public sealed class VpnClient
     private static byte[] BuildExtensions(string sni, byte[] ephPub)
     {
         using var ms = new System.IO.MemoryStream();
-        using var w  = new System.IO.BinaryWriter(ms);
+        using var w = new System.IO.BinaryWriter(ms);
 
         // SNI extension (0x0000)
         var sniBytes = System.Text.Encoding.ASCII.GetBytes(sni);
@@ -263,7 +280,7 @@ public sealed class VpnClient
 
         return ms.ToArray();
     }
-    
+
     /// <summary>Читает ровно buf.Length байт из потока.</summary>
     private static async Task ReadExactAsync(Stream s, byte[] buf, CancellationToken ct)
     {
