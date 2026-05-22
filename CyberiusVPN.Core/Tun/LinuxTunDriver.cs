@@ -40,7 +40,16 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
                 FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
             });
 
-    private Thread? _readerThread;
+    private Thread? _readerThread;    
+    private Thread? _writerThread;
+
+    private readonly Channel<byte[]> _writeChannel =
+        Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(256)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+
     private CancellationTokenSource _cts = new();
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
@@ -85,7 +94,12 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
             Name = $"TUN-Reader-{name}"
         };
         _readerThread.Start();
-
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name         = $"TUN-Writer-{name}"
+        };
+        _writerThread.Start();
         logger.LogInformation("Linux TUN {Name} configured", name);
         return Task.CompletedTask;
     }
@@ -117,6 +131,27 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
 
         _readChannel.Writer.TryComplete();
     }
+    /// <summary>
+    /// Аналогично постоянный цикл записи в отдельном потоке.
+    /// </summary>
+    private void WriterLoop()
+    {
+        while (!_cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                if (_writeChannel.Reader.TryRead(out var packet))
+                    _stream!.Write(packet, 0, packet.Length);
+                else
+                    Thread.Sleep(0);
+            }
+            catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
+            {
+                logger.LogWarning("TUN write error: {Msg}", ex.Message);
+                break;
+            }
+        }
+    }
 
     /// <summary>
     /// Async чтение из channel — не блокирует thread pool.
@@ -126,11 +161,11 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         return await _readChannel.Reader.ReadAsync(ct);
     }
 
-    public Task WritePacketAsync(byte[] packet, CancellationToken ct) => Task.Run(() =>
+    public Task WritePacketAsync(byte[] packet, CancellationToken ct)
     {
-        _stream!.Write(packet, 0, packet.Length);
-        // Убираем Flush — TUN не буферизует, Flush лишний syscall
-    }, ct);
+        _writeChannel.Writer.TryWrite(packet);
+        return Task.CompletedTask;
+    }
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
     {
