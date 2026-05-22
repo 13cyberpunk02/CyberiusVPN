@@ -1,6 +1,7 @@
 ﻿using CyberiusVPN.Core.Crypto;
 using CyberiusVPN.Core.Models;
 using CyberiusVPN.Core.Transport;
+using CyberiusVPN.Core.Tun;
 using Microsoft.Extensions.Logging;
 
 // ─── Генерация ключей (запускается один раз) ───────────────────────────────
@@ -36,7 +37,7 @@ Console.WriteLine("CSharpVPN Client starting...");
 Console.WriteLine($"Server: {config.ServerHost}:{config.ServerPort}");
 Console.WriteLine($"SNI:    {config.SniDomain}");
 
-var client = new VpnClient(config, logFactory);
+var client = new VpnClient(config, logFactory, new WindowsRouteManager());
 await client.RunAsync(cts.Token);
 
 Console.WriteLine("Disconnected.");

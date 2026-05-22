@@ -30,21 +30,22 @@ public sealed class VpnClient
     private readonly ILoggerFactory _loggerFactory;
     private readonly byte[]         _clientPrivateKey;
     private readonly byte[]         _serverPublicKey;
-    private static string _savedGateway = "";
-    private static string _savedIface   = "";
+    private readonly IRouteManager? _routeManager;
 
     /// <summary>
     /// Создаёт VPN клиент.
     /// </summary>
     /// <param name="config">Конфигурация подключения.</param>
     /// <param name="loggerFactory">Фабрика логгеров.</param>
-    public VpnClient(VpnConfig config, ILoggerFactory loggerFactory)
+    /// <param name="routeManager">Менеджер управления маршрутами, смотря на какой платформе запускается</param>
+    public VpnClient(VpnConfig config, ILoggerFactory loggerFactory, IRouteManager? routeManager = null)
     {
         _config           = config;
         _loggerFactory    = loggerFactory;
         _logger           = loggerFactory.CreateLogger<VpnClient>();
         _clientPrivateKey = KeyExchange.FromBase64(config.ClientPrivateKey);
         _serverPublicKey  = KeyExchange.FromBase64(config.ServerPublicKey);
+        _routeManager     = routeManager;
     }
 
     /// <summary>
@@ -74,6 +75,17 @@ public sealed class VpnClient
     /// <summary>Выполняет одну попытку подключения и работы туннеля.</summary>
     private async Task ConnectAndRunAsync(CancellationToken ct)
     {
+        var serverIp = _config.ServerHost;
+        try
+        {
+            var addresses = await Dns.GetHostAddressesAsync(_config.ServerHost, ct);
+            if (addresses.Length > 0) serverIp = addresses[0].ToString();
+        }
+        catch
+        {
+            // ignored
+        }
+
         using var tcp = new TcpClient();
         tcp.NoDelay = true;
 
@@ -111,7 +123,7 @@ public sealed class VpnClient
             await tun.OpenAsync("vpn0", assignedIp, _config.TunMask, _config.Mtu);
 
             // 7. Прописываем маршрут к серверу через реальный шлюз
-            SetupRoutes(_config.ServerHost, assignedIp);
+            _routeManager?.Setup(serverIp, assignedIp, "vpn0");
 
             // 8. Запускаем туннель
             var sessionId = (uint)Random.Shared.Next();
@@ -126,7 +138,7 @@ public sealed class VpnClient
         finally
         {
             // Восстанавливаем маршруты при любом выходе
-            CleanupRoutes(_config.ServerHost);
+            _routeManager?.Cleanup(serverIp);
         }
     }
 
@@ -251,167 +263,7 @@ public sealed class VpnClient
 
         return ms.ToArray();
     }
-
-    /// <summary>
-    /// Прописывает маршрут к VPN серверу через реальный шлюз.
-    /// Без этого трафик к серверу пойдёт через TUN и создаст петлю.
-    /// </summary>
-    private static void SetupRoutes(string serverHost, string assignedIp)
-    {
-        // Резолвим hostname в IP
-        var serverIp = serverHost;
-        try
-        {
-            var addresses = System.Net.Dns.GetHostAddresses(serverHost);
-            if (addresses.Length > 0) serverIp = addresses[0].ToString();
-        }
-        catch
-        {
-            // ignored
-        }
-
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            var gw = GetDefaultGateway();
-            if (string.IsNullOrEmpty(gw)) return;
-            Console.WriteLine($"Default gateway: {gw}, server: {serverIp}");
-
-            var ifIndex = GetInterfaceIndex("vpn0");
-            Console.WriteLine($"vpn0 interface index: {ifIndex}");
-
-            Run("route", $"delete {serverIp} mask 255.255.255.255");
-            Run("route", $"add {serverIp} mask 255.255.255.255 {gw} metric 1");
-            Run("route", "delete 0.0.0.0 mask 0.0.0.0 172.18.0.2");
-            Run("route", "delete 0.0.0.0 mask 128.0.0.0");
-            Run("route", "delete 128.0.0.0 mask 128.0.0.0");
-            Run("route", $"add 0.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
-            Run("route", $"add 128.0.0.0 mask 128.0.0.0 {assignedIp} IF {ifIndex} metric 1");
-            Run("netsh", "interface ip set dns \"vpn0\" static 8.8.8.8");
-        }
-        else // Linux
-        {
-            var defaultRoute = RunAndRead("ip", "route show default");
-            var parts = defaultRoute.Split(' ');
-            var gw    = parts.Length > 2 ? parts[2] : "";
-            var iface = parts.Length > 4 ? parts[4] : "";
-
-            _savedGateway = gw;
-            _savedIface   = iface;
-            
-            Console.WriteLine($"Gateway: {gw} via {iface}, server: {serverIp}");
-
-            Run("ip", $"route add {serverIp}/32 via {gw} dev {iface}");
-            Run("ip", "route del default");
-            Run("ip", "route add default dev vpn0");
-            Run("bash", "-c \"echo 'nameserver 8.8.8.8' > /etc/resolv.conf\"");
-        }
-    }
     
-    
-    private static int GetInterfaceIndex(string interfaceName)
-    {
-        try
-        {
-            foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (ni.Name.Equals(interfaceName, StringComparison.OrdinalIgnoreCase))
-                {
-                    var props = ni.GetIPProperties();
-                    return props.GetIPv4Properties().Index;
-                }
-            }
-        }
-        catch
-        {
-            // ignored
-        }
-
-        return 0;
-    }
-
-    /// <summary>Удаляет добавленные маршруты при отключении.</summary>
-    private static void CleanupRoutes(string serverHost)
-    {
-        var serverIp = serverHost;
-        try
-        {
-            var addresses = System.Net.Dns.GetHostAddresses(serverHost);
-            if (addresses.Length > 0) serverIp = addresses[0].ToString();
-        }
-        catch
-        {
-            // ignored
-        }
-
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            Run("route", $"delete {serverIp} mask 255.255.255.255");
-            Run("route", "delete 0.0.0.0 mask 128.0.0.0");
-            Run("route", "delete 128.0.0.0 mask 128.0.0.0");
-            Console.WriteLine("Routes restored.");
-        }
-        else // Linux
-        {
-            Run("ip", $"route del {serverIp}/32 2>/dev/null || true");
-            Run("ip", "route del default dev vpn0 2>/dev/null || true");
-            if (!string.IsNullOrEmpty(_savedGateway) && !string.IsNullOrEmpty(_savedIface))
-            {
-                Run("ip", $"route add default via {_savedGateway} dev {_savedIface}");
-                Console.WriteLine($"Default route restored: via {_savedGateway} dev {_savedIface}");
-            }
-            else
-            {
-                // Fallback — перезапуск NetworkManager
-                Run("systemctl", "restart NetworkManager");
-            }
-            Console.WriteLine("Routes restored.");
-        }
-    }
-    
-    // Читает stdout команды
-    private static string RunAndRead(string cmd, string args)
-    {
-        var psi = new System.Diagnostics.ProcessStartInfo(cmd, args)
-        {
-            RedirectStandardOutput = true,
-            UseShellExecute = false
-        };
-        var p = System.Diagnostics.Process.Start(psi)!;
-        var output = p.StandardOutput.ReadLine() ?? "";
-        p.WaitForExit();
-        return output;
-    }
-
-    /// <summary>Читает шлюз по умолчанию из таблицы маршрутизации Windows.</summary>
-    private static string GetDefaultGateway()
-    {
-        try
-        {
-            var psi = new System.Diagnostics.ProcessStartInfo("route", "print 0.0.0.0")
-            {
-                RedirectStandardOutput = true,
-                UseShellExecute        = false
-            };
-            var p      = System.Diagnostics.Process.Start(psi)!;
-            var output = p.StandardOutput.ReadToEnd();
-            p.WaitForExit();
-
-            foreach (var line in output.Split('\n'))
-            {
-                var parts = line.Trim().Split(
-                    new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-
-                if (parts.Length >= 3
-                    && parts[0] == "0.0.0.0"
-                    && parts[1] == "0.0.0.0"
-                    && IPAddress.TryParse(parts[2], out _))
-                    return parts[2];
-            }
-        }
-        catch { }
-        return "";
-    }
-
     /// <summary>Читает ровно buf.Length байт из потока.</summary>
     private static async Task ReadExactAsync(Stream s, byte[] buf, CancellationToken ct)
     {
@@ -422,19 +274,6 @@ public sealed class VpnClient
             if (read == 0) throw new EndOfStreamException();
             offset += read;
         }
-    }
-
-    /// <summary>Запускает системную команду без ожидания вывода.</summary>
-    private static void Run(string cmd, string args)
-    {
-        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-        {
-            FileName               = cmd,
-            Arguments              = args,
-            RedirectStandardOutput = true,
-            RedirectStandardError  = true,
-            UseShellExecute        = false
-        })?.WaitForExit();
     }
 
     /// <summary>Меняет порядок байт 16-битного числа (big-endian для TLS).</summary>
