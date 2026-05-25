@@ -80,6 +80,24 @@ public sealed class PacketCipher : IDisposable
             plaintext, aad);
         return plaintext;
     }
+    
+    /// <summary>
+    /// Перегрузка Decrypt для арендованных буферов из ArrayPool.
+    /// Принимает Span чтобы избежать лишней копии.
+    /// </summary>
+    public byte[] Decrypt(ReadOnlySpan<byte> ciphertextWithTag, byte[] aad, ulong nonce)
+    {
+        BuildNonce(nonce);
+
+        var ciphertextLen = ciphertextWithTag.Length - 16;
+        var plaintext     = new byte[ciphertextLen];
+
+        _cipher.Decrypt(_nonceBuf,
+            ciphertextWithTag.Slice(0, ciphertextLen),
+            ciphertextWithTag.Slice(ciphertextLen, 16),
+            plaintext, aad);
+        return plaintext;
+    }
 
     /// <summary>
     /// Строит nonce прямо в _nonceBuf без аллокации.
