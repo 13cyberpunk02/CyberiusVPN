@@ -29,37 +29,28 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
     private const short IFF_NO_PI = 0x1000;
     private const int O_RDWR = 2;
 
-    // Постоянный буфер чтения — не аллоцируем на каждый пакет
     private readonly byte[] _readBuffer = new byte[65535];
+    private readonly byte[] _writeBuffer = new byte[65535];
 
-    // Channel для передачи пакетов из фонового потока в async pipeline
-    private readonly Channel<byte[]> _readChannel =
-        Channel.CreateBounded<byte[]>(
-            new BoundedChannelOptions(256)
-            {
-                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
-            });
-
-    private Thread? _readerThread;    
-    private Thread? _writerThread;
-
-    private readonly Channel<byte[]> _writeChannel =
-        Channel.CreateBounded<byte[]>(
-            new BoundedChannelOptions(256)
+    // Один channel для чтения — без WriterLoop, пишем напрямую
+    private readonly Channel<(byte[] data, int length)> _readChannel =
+        Channel.CreateBounded<(byte[], int)>(
+            new BoundedChannelOptions(128)
             {
                 FullMode = BoundedChannelFullMode.DropOldest
             });
 
-    private CancellationTokenSource _cts = new();
+    // Для записи — SemaphoreSlim вместо channel
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private Thread? _readerThread;
+    private readonly CancellationTokenSource _cts = new();
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
     private struct IfReq
     {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
         public string Name;
-
         public short Flags;
-
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 22)]
         public byte[] Padding;
     }
@@ -71,18 +62,10 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         if (fd < 0)
             throw new IOException($"Cannot open /dev/net/tun, errno={Marshal.GetLastWin32Error()}");
 
-        var ifr = new IfReq
-        {
-            Name = name,
-            Flags = IFF_TUN | IFF_NO_PI,
-            Padding = new byte[22]
-        };
-
+        var ifr = new IfReq { Name = name, Flags = IFF_TUN | IFF_NO_PI, Padding = new byte[22] };
         if (ioctl(fd, TUNSETIFF, ref ifr) < 0)
             throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
 
-        // bufferSize: 1 отключает внутренний буфер FileStream
-        // TUN устройство нельзя читать через буферизованный поток
         var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
         _stream = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
 
@@ -94,33 +77,25 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
             Name = $"TUN-Reader-{name}"
         };
         _readerThread.Start();
-        _writerThread = new Thread(WriterLoop)
-        {
-            IsBackground = true,
-            Name         = $"TUN-Writer-{name}"
-        };
-        _writerThread.Start();
+
         logger.LogInformation("Linux TUN {Name} configured", name);
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Постоянный цикл чтения в отдельном потоке.
-    /// Блокирующий Read не мешает async pipeline — он в своём потоке.
-    /// </summary>
     private void ReaderLoop()
     {
         while (!_cts.Token.IsCancellationRequested)
         {
             try
             {
-                // Читаем напрямую через Span без внутреннего буфера
                 int read = _stream!.Read(_readBuffer.AsSpan());
                 if (read <= 0) continue;
 
-                var packet = new byte[read];
-                Buffer.BlockCopy(_readBuffer, 0, packet, 0, read);
-                _readChannel.Writer.TryWrite(packet);
+                // Аллоцируем только если channel не переполнен
+                if (_readChannel.Writer.TryWrite((_readBuffer[..read], read)))
+                    continue;
+
+                // Channel переполнен — пропускаем пакет (drop)
             }
             catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
             {
@@ -128,43 +103,27 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
                 break;
             }
         }
-
         _readChannel.Writer.TryComplete();
     }
-    /// <summary>
-    /// Аналогично постоянный цикл записи в отдельном потоке.
-    /// </summary>
-    private void WriterLoop()
-    {
-        while (!_cts.Token.IsCancellationRequested)
-        {
-            try
-            {
-                if (_writeChannel.Reader.TryRead(out var packet))
-                    _stream!.Write(packet, 0, packet.Length);
-                else
-                    Thread.Sleep(0);
-            }
-            catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
-            {
-                logger.LogWarning("TUN write error: {Msg}", ex.Message);
-                break;
-            }
-        }
-    }
 
-    /// <summary>
-    /// Async чтение из channel — не блокирует thread pool.
-    /// </summary>
     public async Task<byte[]> ReadPacketAsync(CancellationToken ct)
     {
-        return await _readChannel.Reader.ReadAsync(ct);
+        var (data, _) = await _readChannel.Reader.ReadAsync(ct);
+        return data;
     }
 
-    public Task WritePacketAsync(byte[] packet, CancellationToken ct)
+    // Запись напрямую без WriterLoop и channel — меньше overhead
+    public async Task WritePacketAsync(byte[] packet, CancellationToken ct)
     {
-        _writeChannel.Writer.TryWrite(packet);
-        return Task.CompletedTask;
+        await _writeLock.WaitAsync(ct);
+        try
+        {
+            await Task.Run(() => _stream!.Write(packet, 0, packet.Length), ct);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
@@ -177,15 +136,14 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
     private static int MaskToCidr(string mask)
     {
         var bytes = IPAddress.Parse(mask).GetAddressBytes();
-        var bits = 0;
+        int bits = 0;
         foreach (var b in bytes)
-            bits += BitOperations.PopCount(b);
+            bits += System.Numerics.BitOperations.PopCount(b);
         return bits;
     }
 
-    private static void Run(string cmd, string args)
-    {
-        Process.Start(new ProcessStartInfo
+    private static void Run(string cmd, string args) =>
+        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
             FileName = cmd,
             Arguments = args,
@@ -193,7 +151,6 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
             RedirectStandardError = true,
             UseShellExecute = false
         })?.WaitForExit();
-    }
 
     public async ValueTask DisposeAsync()
     {

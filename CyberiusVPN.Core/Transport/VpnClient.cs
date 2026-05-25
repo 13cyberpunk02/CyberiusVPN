@@ -32,6 +32,7 @@ public sealed class VpnClient
     private readonly byte[] _serverPublicKey;
     private readonly IRouteManager? _routeManager;
     private readonly ITunDriver? _tunDriver;
+    private readonly Action<int>? _protectSocket;
 
     /// <summary>
     /// Создаёт VPN клиент.
@@ -44,7 +45,8 @@ public sealed class VpnClient
         VpnConfig config,
         ILoggerFactory loggerFactory,
         IRouteManager? routeManager = null,
-        ITunDriver? tunDriver = null)
+        ITunDriver? tunDriver = null,
+        Action<int>? protectSocket = null)
     {
         _config = config;
         _loggerFactory = loggerFactory;
@@ -53,6 +55,7 @@ public sealed class VpnClient
         _serverPublicKey = KeyExchange.FromBase64(config.ServerPublicKey);
         _routeManager = routeManager;
         _tunDriver = tunDriver;
+        _protectSocket = protectSocket;
     }
 
     /// <summary>
@@ -95,6 +98,12 @@ public sealed class VpnClient
 
         using var tcp = new TcpClient();
         tcp.NoDelay = true;
+
+        if (_protectSocket != null)
+        {
+            var socketFd = (int)tcp.Client.Handle;
+            _protectSocket(socketFd);
+        }
 
         await tcp.ConnectAsync(_config.ServerHost, _config.ServerPort, ct);
         _logger.LogInformation("TCP connected");

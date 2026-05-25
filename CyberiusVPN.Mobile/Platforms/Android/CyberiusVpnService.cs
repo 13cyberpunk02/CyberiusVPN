@@ -80,7 +80,8 @@ public class CyberiusVpnService : VpnService
                 var tunDriver = new AndroidTunDriver(this);
                 var client = new VpnClient(config, logFactory,
                     routeManager: null,
-                    tunDriver: tunDriver);
+                    tunDriver: tunDriver,
+                    protectSocket: fd => Protect(fd));
 
                 await client.RunAsync(_cts.Token);
             }

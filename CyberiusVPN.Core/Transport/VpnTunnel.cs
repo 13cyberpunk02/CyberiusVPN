@@ -63,73 +63,31 @@ public sealed class VpnTunnel
     /// <summary>TUN → шифруем → сервер.</summary>
     private async Task PumpOutboundAsync(CancellationToken ct)
     {
-        // Канал между читателем TUN и отправителем
-        var channel = System.Threading.Channels.Channel.CreateBounded<byte[]>(
-            new System.Threading.Channels.BoundedChannelOptions(32)
-            {
-                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
-            });
-
-        // Читатель TUN — просто читает пакеты
-        var reader = Task.Run(async () =>
+        // Убираем лишний channel — читаем напрямую из TUN
+        while (!ct.IsCancellationRequested)
         {
-            while (!ct.IsCancellationRequested)
-            {
-                var packet = await _tun.ReadPacketAsync(ct);
-                if (packet.Length > 0)
-                    await channel.Writer.WriteAsync(packet, ct);
-            }
-        }, ct);
-
-        // Отправитель — шифрует и отправляет
-        var sender = Task.Run(async () =>
-        {
-            await foreach (var packet in channel.Reader.ReadAllAsync(ct))
-            {
+            var packet = await _tun.ReadPacketAsync(ct);
+            if (packet.Length > 0)
                 await _framer.SendPacketAsync(_transport, packet, PacketType.Data, ct);
-            }
-        }, ct);
-
-        await Task.WhenAll(reader, sender);
+        }
     }
 
     /// <summary>Сервер → расшифровываем → TUN.</summary>
     private async Task PumpInboundAsync(CancellationToken ct)
     {
-        // Channel между получателем TCP и записью в TUN
-        var channel = System.Threading.Channels.Channel.CreateBounded<byte[]>(
-            new System.Threading.Channels.BoundedChannelOptions(64)
-            {
-                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropOldest
-            });
-
-        // Получатель — читает и расшифровывает из TCP
-        var receiver = Task.Run(async () =>
+        // Убираем лишний channel — пишем напрямую в TUN
+        while (!ct.IsCancellationRequested)
         {
-            while (!ct.IsCancellationRequested)
-            {
-                var result = await _framer.ReceivePacketAsync(_transport, ct);
-                if (result is null) break;
+            var result = await _framer.ReceivePacketAsync(_transport, ct);
+            if (result is null) break;
 
-                var (type, payload) = result.Value;
-                if (type == PacketType.Data && payload.Length > 0)
-                    await channel.Writer.WriteAsync(payload, ct);
-            }
-
-            channel.Writer.TryComplete();
-        }, ct);
-
-        // Писатель — пишет в TUN
-        var writer = Task.Run(async () =>
-        {
-            await foreach (var payload in channel.Reader.ReadAllAsync(ct))
+            var (type, payload) = result.Value;
+            if (type == PacketType.Data && payload.Length > 0)
             {
                 await _tun.WritePacketAsync(payload, ct);
                 _logger.LogTrace("← {Bytes} bytes", payload.Length);
             }
-        }, ct);
-
-        await Task.WhenAll(receiver, writer);
+        }
     }
 
     /// <summary>Keepalive каждые 25 секунд чтобы NAT не закрыл соединение.</summary>

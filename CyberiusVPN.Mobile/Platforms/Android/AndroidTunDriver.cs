@@ -45,20 +45,26 @@ public sealed class AndroidTunDriver : ITunDriver
         var builder = new VpnService.Builder(_vpnService)
             .SetSession("CyberiusVPN")
             .AddAddress(address, 24)
-            .AddRoute("0.0.0.0", 0)
-            .AddDnsServer("8.8.8.8")
-            .AddDnsServer("8.8.4.4")
             .SetMtu(mtu)
-            .SetBlocking(true);
+            .SetBlocking(true)
+            .AddDnsServer("8.8.8.8")
+            .AddDnsServer("8.8.4.4");
+
+        // Весь трафик через VPN — два маршрута покрывают 0.0.0.0/0
+        builder.AddRoute("0.0.0.0", 1);
+        builder.AddRoute("128.0.0.0", 1);
+
+        // Исключаем адрес сервера чтобы не было петли
+        // Android 21+ поддерживает AddDisallowedApplication
+        // но проще исключить через AllowBypass
+        builder.AllowBypass();
 
         _tunFd = builder.Establish()
-            ?? throw new InvalidOperationException("VpnService.Builder.Establish() вернул null");
+            ?? throw new InvalidOperationException("Establish() вернул null");
 
-        // DetachFd() возвращает сырой int fd и передаёт владение нам
-        // FileDescriptor.Handle на Android ненадёжен
         var fd = _tunFd.DetachFd();
 
-        var safeHandle = new global::Microsoft.Win32.SafeHandles.SafeFileHandle(
+        var safeHandle = new Microsoft.Win32.SafeHandles.SafeFileHandle(
             new IntPtr(fd), ownsHandle: true);
 
         _tunStream = new FileStream(
@@ -111,15 +117,20 @@ public sealed class AndroidTunDriver : ITunDriver
         {
             try
             {
+                // Блокируем поток пока нет пакетов — без spin loop
                 if (_writeChannel.Reader.TryRead(out var packet))
+                {
                     _tunStream!.Write(packet, 0, packet.Length);
+                }
                 else
-                    Thread.Sleep(0);
+                {
+                    // Ждём следующего пакета без сжигания CPU
+                    var waitTask = _writeChannel.Reader.WaitToReadAsync(_cts.Token).AsTask();
+                    waitTask.GetAwaiter().GetResult();
+                }
             }
-            catch (Exception) when (!_cts.Token.IsCancellationRequested)
-            {
-                break;
-            }
+            catch (System.OperationCanceledException) { break; }
+            catch (Exception) when (!_cts.Token.IsCancellationRequested) { break; }
         }
     }
 
