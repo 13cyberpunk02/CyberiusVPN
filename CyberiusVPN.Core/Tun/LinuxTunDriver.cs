@@ -1,4 +1,4 @@
-using System.Diagnostics;
+using System.Buffers;
 using System.Net;
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -7,16 +7,10 @@ using Microsoft.Extensions.Logging;
 
 namespace CyberiusVPN.Core.Tun;
 
-/// <summary>
-/// Linux TUN драйвер через /dev/net/tun.
-/// Требует root или CAP_NET_ADMIN.
-/// FileStream открывается в синхронном режиме (TUN fd не поддерживает overlapped I/O),
-/// чтение/запись выполняются в Task.Run для не-блокирующей async работы.
-/// </summary>
 internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
 {
     private FileStream? _stream;
-    private string _name = "";
+    private string      _name = "";
 
     [DllImport("libc", SetLastError = true)]
     private static extern int ioctl(int fd, uint request, ref IfReq ifr);
@@ -24,15 +18,14 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
     [DllImport("libc", SetLastError = true)]
     private static extern int open([MarshalAs(UnmanagedType.LPStr)] string path, int flags);
 
-    private const uint TUNSETIFF = 0x400454CA;
-    private const short IFF_TUN = 0x0001;
+    private const uint  TUNSETIFF = 0x400454CA;
+    private const short IFF_TUN   = 0x0001;
     private const short IFF_NO_PI = 0x1000;
-    private const int O_RDWR = 2;
+    private const int   O_RDWR    = 2;
 
     private readonly byte[] _readBuffer = new byte[65535];
-    private readonly byte[] _writeBuffer = new byte[65535];
 
-    // Один channel для чтения — без WriterLoop, пишем напрямую
+    // Channel для чтения из TUN
     private readonly Channel<(byte[] data, int length)> _readChannel =
         Channel.CreateBounded<(byte[], int)>(
             new BoundedChannelOptions(128)
@@ -40,9 +33,16 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
                 FullMode = BoundedChannelFullMode.DropOldest
             });
 
-    // Для записи — SemaphoreSlim вместо channel
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private Thread? _readerThread;
+    // Channel для записи в TUN — отдельный поток без Task.Run
+    private readonly Channel<byte[]> _writeChannel =
+        Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(256)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest
+            });
+
+    private Thread?                      _readerThread;
+    private Thread?                      _writerThread;
     private readonly CancellationTokenSource _cts = new();
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
@@ -50,7 +50,7 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
     {
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 16)]
         public string Name;
-        public short Flags;
+        public short  Flags;
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = 22)]
         public byte[] Padding;
     }
@@ -67,16 +67,23 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
             throw new IOException($"ioctl TUNSETIFF failed: {Marshal.GetLastWin32Error()}");
 
         var handle = new Microsoft.Win32.SafeHandles.SafeFileHandle(new IntPtr(fd), ownsHandle: true);
-        _stream = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
+        _stream    = new FileStream(handle, FileAccess.ReadWrite, bufferSize: 1, isAsync: false);
 
         ConfigureInterface(name, address, mask, mtu);
 
         _readerThread = new Thread(ReaderLoop)
         {
             IsBackground = true,
-            Name = $"TUN-Reader-{name}"
+            Name         = $"TUN-Reader-{name}"
         };
         _readerThread.Start();
+
+        _writerThread = new Thread(WriterLoop)
+        {
+            IsBackground = true,
+            Name         = $"TUN-Writer-{name}"
+        };
+        _writerThread.Start();
 
         logger.LogInformation("Linux TUN {Name} configured", name);
         return Task.CompletedTask;
@@ -91,11 +98,11 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
                 int read = _stream!.Read(_readBuffer.AsSpan());
                 if (read <= 0) continue;
 
-                var pooled = System.Buffers.ArrayPool<byte>.Shared.Rent(read);
+                var pooled = ArrayPool<byte>.Shared.Rent(read);
                 Buffer.BlockCopy(_readBuffer, 0, pooled, 0, read);
 
                 if (!_readChannel.Writer.TryWrite((pooled, read)))
-                    System.Buffers.ArrayPool<byte>.Shared.Return(pooled);
+                    ArrayPool<byte>.Shared.Return(pooled);
             }
             catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
             {
@@ -106,27 +113,46 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
         _readChannel.Writer.TryComplete();
     }
 
+    private void WriterLoop()
+    {
+        while (!_cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                if (_writeChannel.Reader.TryRead(out var packet))
+                {
+                    _stream!.Write(packet, 0, packet.Length);
+                }
+                else
+                {
+                    // Блокируем поток пока нет данных — не жжём CPU
+                    _writeChannel.Reader.WaitToReadAsync(_cts.Token)
+                        .AsTask().GetAwaiter().GetResult();
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
+            {
+                logger.LogWarning("TUN write error: {Msg}", ex.Message);
+                break;
+            }
+        }
+    }
+
     public async Task<byte[]> ReadPacketAsync(CancellationToken ct)
     {
         var (pooled, length) = await _readChannel.Reader.ReadAsync(ct);
         var result = new byte[length];
         Buffer.BlockCopy(pooled, 0, result, 0, length);
-        System.Buffers.ArrayPool<byte>.Shared.Return(pooled);
+        ArrayPool<byte>.Shared.Return(pooled);
         return result;
     }
 
-    // Запись напрямую без WriterLoop и channel — меньше overhead
-    public async Task WritePacketAsync(byte[] packet, CancellationToken ct)
+    // Без Task.Run — просто кладём в channel, WriterLoop запишет
+    public Task WritePacketAsync(byte[] packet, CancellationToken ct)
     {
-        await _writeLock.WaitAsync(ct);
-        try
-        {
-            await Task.Run(() => _stream!.Write(packet, 0, packet.Length), ct);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        _writeChannel.Writer.TryWrite(packet);
+        return Task.CompletedTask;
     }
 
     private static void ConfigureInterface(string name, string address, string mask, int mtu)
@@ -139,20 +165,20 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
     private static int MaskToCidr(string mask)
     {
         var bytes = IPAddress.Parse(mask).GetAddressBytes();
-        int bits = 0;
+        int bits  = 0;
         foreach (var b in bytes)
-            bits += System.Numerics.BitOperations.PopCount(b);
+            bits += BitOperations.PopCount(b);
         return bits;
     }
 
     private static void Run(string cmd, string args) =>
         System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
         {
-            FileName = cmd,
-            Arguments = args,
+            FileName               = cmd,
+            Arguments              = args,
             RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false
+            RedirectStandardError  = true,
+            UseShellExecute        = false
         })?.WaitForExit();
 
     public async ValueTask DisposeAsync()
