@@ -91,11 +91,11 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
                 int read = _stream!.Read(_readBuffer.AsSpan());
                 if (read <= 0) continue;
 
-                // Аллоцируем только если channel не переполнен
-                if (_readChannel.Writer.TryWrite((_readBuffer[..read], read)))
-                    continue;
+                var pooled = System.Buffers.ArrayPool<byte>.Shared.Rent(read);
+                Buffer.BlockCopy(_readBuffer, 0, pooled, 0, read);
 
-                // Channel переполнен — пропускаем пакет (drop)
+                if (!_readChannel.Writer.TryWrite((pooled, read)))
+                    System.Buffers.ArrayPool<byte>.Shared.Return(pooled);
             }
             catch (Exception ex) when (!_cts.Token.IsCancellationRequested)
             {
@@ -108,8 +108,11 @@ internal sealed class LinuxTunDriver(ILogger logger) : ITunDriver
 
     public async Task<byte[]> ReadPacketAsync(CancellationToken ct)
     {
-        var (data, _) = await _readChannel.Reader.ReadAsync(ct);
-        return data;
+        var (pooled, length) = await _readChannel.Reader.ReadAsync(ct);
+        var result = new byte[length];
+        Buffer.BlockCopy(pooled, 0, result, 0, length);
+        System.Buffers.ArrayPool<byte>.Shared.Return(pooled);
+        return result;
     }
 
     // Запись напрямую без WriterLoop и channel — меньше overhead
